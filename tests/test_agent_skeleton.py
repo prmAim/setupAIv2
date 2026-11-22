@@ -15,9 +15,16 @@ import agent_skeleton as skeleton
 EXISTING_TEST = '''import unittest
 
 
+def expected_total():
+    return 2
+
+
 class ExistingTests(unittest.TestCase):
     def test_addition(self):
         self.assertEqual(1 + 1, 2)
+
+    def test_truth(self):
+        self.assertTrue(True)
 '''
 
 GOOD_FUNCTION = '''"""Harmless helper used by the tracer-bullet prototype run."""
@@ -146,14 +153,63 @@ class GateTests(GraphFixture):
         self.assertEqual(names, ["tests/test_smoke_ping.py", "tools/smoke_ping.py"])
 
     def test_test_integrity_blocks_modified_existing_test(self):
-        modified = EXISTING_TEST + "\n    def test_added_later(self):\n        self.assertTrue(True)\n"
+        modified = EXISTING_TEST.replace("self.assertEqual(1 + 1, 2)", "self.assertEqual(1 + 1, 3)")
         task = self.build_task(patch={"tests/test_existing.py": modified})
         report = self.run_graph(task)
         self.assertEqual(report["verdict"], "escalated")
         gate = report["gates"]["test-integrity"]
         self.assertNotEqual(gate["exit_code"], 0)
-        self.assertIn("modified baseline test file", gate["detail"])
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["rule"], "test-body-modified")
+        self.assertIn("test-body-modified: tests/test_existing.py", gate["detail"])
+        self.assertEqual(
+            gate["findings"],
+            [
+                {
+                    "file": "tests/test_existing.py",
+                    "rule": "test-body-modified",
+                    "evidence": "test ExistingTests.test_addition",
+                }
+            ],
+        )
         self.assertEqual(report["gates"]["tests"]["command"], ["not-run"])
+
+    def test_test_integrity_blocks_modified_helper(self):
+        modified = EXISTING_TEST.replace("return 2", "return 3")
+        task = self.build_task(patch={"tests/test_existing.py": modified})
+        report = self.run_graph(task)
+        self.assertEqual(report["verdict"], "escalated")
+        gate = report["gates"]["test-integrity"]
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["rule"], "helper-modified")
+        self.assertIn("helper-modified: tests/test_existing.py", gate["detail"])
+
+    def test_test_integrity_blocks_deleted_test(self):
+        deleted = EXISTING_TEST.replace(
+            "\n    def test_truth(self):\n        self.assertTrue(True)\n", ""
+        )
+        self.assertNotEqual(deleted, EXISTING_TEST)
+        task = self.build_task(patch={"tests/test_existing.py": deleted})
+        report = self.run_graph(task)
+        self.assertEqual(report["verdict"], "escalated")
+        gate = report["gates"]["test-integrity"]
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["rule"], "test-removed")
+        self.assertIn("test-removed: tests/test_existing.py", gate["detail"])
+
+    def test_adding_new_test_to_existing_file_is_allowed(self):
+        extended = EXISTING_TEST + (
+            "\n    def test_added_later(self):\n        self.assertTrue(True)\n"
+        )
+        task = self.build_task(patch={"tests/test_existing.py": extended})
+        report = self.run_graph(task)
+        gate = report["gates"]["test-integrity"]
+        self.assertEqual(gate["exit_code"], 0, gate["detail"])
+        self.assertTrue(gate["passed"], gate["detail"])
+        self.assertIsNone(gate["rule"])
+        self.assertEqual(gate["findings"], [])
+        self.assertEqual(report["verdict"], "pass")
+        self.assertEqual(report["gates"]["tests"]["exit_code"], 0)
 
     def test_diff_scope_blocks_github_workflow(self):
         task = self.build_task(

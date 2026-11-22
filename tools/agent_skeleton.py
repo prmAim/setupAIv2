@@ -25,7 +25,12 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[1]
+TOOLS = Path(__file__).resolve().parent
 WORK_ROOT = Path(r"C:\Git\_wf")
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+import test_integrity as ast_integrity  # noqa: E402  (tools dir is on sys.path above)
 
 ENGINE = "fake"
 MAX_FIX_ATTEMPTS = 3
@@ -76,6 +81,8 @@ class GateResult(BaseModel):
     passed: bool
     detail: str = ""
     evidence: str | None = None
+    rule: str | None = None
+    findings: list[dict[str, str]] = Field(default_factory=list)
 
 
 class TaskSpec(BaseModel):
@@ -434,47 +441,84 @@ class Runtime:
         )
         return self.record_gate(result)
 
+    def test_paths(self) -> list[str]:
+        """Test files under ``test_roots`` in the baseline and the working tree."""
+        paths: set[str] = set()
+        for root in self.task.test_roots:
+            normalized = root.replace("\\", "/").strip("/")
+            try:
+                listing = git(
+                    self.repo,
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    self.task.baseline_sha,
+                    "--",
+                    normalized,
+                )
+            except SkeletonError:
+                listing = ""
+            paths.update(
+                line.replace("\\", "/") for line in listing.splitlines() if line.strip()
+            )
+            base = safe_relative(self.repo, normalized)
+            if base.is_dir():
+                for path in base.rglob("*"):
+                    if path.is_file() and "__pycache__" not in path.parts:
+                        paths.add(path.relative_to(self.repo).as_posix())
+        return sorted(item for item in paths if item.endswith((".py", ".java")))
+
     def test_integrity(self) -> dict[str, Any]:
         started = time.perf_counter()
-        problems: list[str] = []
-        baseline_files: list[str] = []
+        paths = self.test_paths()
+        comparison = ast_integrity.compare(self.repo, self.task.baseline_sha, paths)
+        findings = [
+            {"file": item.file, "rule": item.rule, "evidence": item.evidence}
+            for item in comparison.findings
+        ]
+        baseline_set: set[str] = set()
         for root in self.task.test_roots:
             listing = git(
                 self.repo, "ls-tree", "-r", "--name-only", self.task.baseline_sha, "--", root
             )
-            baseline_files.extend(
-                line.replace("\\", "/") for line in listing.splitlines() if line.endswith(".py")
+            baseline_set.update(
+                line.replace("\\", "/") for line in listing.splitlines() if line.strip()
             )
-        for relative in sorted(baseline_files):
-            expected = sha256_text(git(self.repo, "show", f"{self.task.baseline_sha}:{relative}"))
+        for relative in paths:
+            if relative in baseline_set or not relative.endswith(".py"):
+                continue
             target = self.repo / relative
             if not target.is_file():
-                problems.append(f"deleted baseline test file: {relative}")
                 continue
-            if file_digest(target) != expected:
-                problems.append(f"modified baseline test file: {relative}")
-        baseline_set = set(baseline_files)
-        for root in self.task.test_roots:
-            base = safe_relative(self.repo, root)
-            if not base.is_dir():
-                continue
-            for path in sorted(base.rglob("*.py")):
-                relative = path.relative_to(self.repo).as_posix()
-                if relative in baseline_set or "__pycache__" in relative:
-                    continue
-                markers = SKIP_MARKERS.search(path.read_text(encoding="utf-8", errors="replace"))
-                if markers:
-                    problems.append(f"skip/xfail marker in new test file: {relative}")
-        detail = "baseline test files unchanged; new test files carry no skip/xfail markers"
-        if problems:
-            detail = "; ".join(problems)
+            marker = SKIP_MARKERS.search(target.read_text(encoding="utf-8", errors="replace"))
+            if marker:
+                findings.append(
+                    {
+                        "file": relative,
+                        "rule": "skip-marker-added",
+                        "evidence": f"skip/xfail marker in new test file: {marker.group(0)}",
+                    }
+                )
+        findings.sort(key=lambda item: (item["file"], item["rule"], item["evidence"]))
+        rules = sorted({item["rule"] for item in findings})
+        if findings:
+            detail = "; ".join(
+                f"{item['rule']}: {item['file']}"
+                + (f" ({item['evidence']})" if item["evidence"] else "")
+                for item in findings
+            )
+        else:
+            detail = f"{comparison.summary}; new test files carry no skip/xfail markers"
+        exit_code = 1 if findings else comparison.exit_code
         result = GateResult(
             name="test-integrity",
-            command=["sha256", "git-ls-tree", self.task.baseline_sha, *self.task.test_roots],
-            exit_code=1 if problems else 0,
+            command=["ast", "git-show", self.task.baseline_sha, *self.task.test_roots],
+            exit_code=exit_code,
             duration_ms=int((time.perf_counter() - started) * 1000),
-            passed=not problems,
+            passed=exit_code == 0,
             detail=detail[:2000],
+            rule=", ".join(rules) if rules else None,
+            findings=findings,
         )
         return self.record_gate(result)
 
