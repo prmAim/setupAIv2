@@ -1,0 +1,26 @@
+{
+  "default": "orbita",
+  "profiles": {
+    "orbita": {
+      "description": "Java/Maven backend and TypeScript frontend owned by the agent; everything else needs a human.",
+      "forbidden": [
+        ".github/",
+        "backend/src/main/resources/db/migration/",
+        "uv.lock",
+        "frontend/package-lock.json",
+        "backend/pom.xml",
+        ".env*",
+        "deploy/.env"
+      ],
+      "allow": [
+        "backend/src/main/java/**",
+        "backend/src/test/java/**",
+        "frontend/src/**",
+        "tools/**",
+        "docs/**",
+        "tests/**"
+      ],
+      "enforce_allow": true
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "task_id": "t16-orbita-forbidden",
+  "repo": "C:\\Git\\_wf\\t16-run",
+  "baseline_sha": "f16e5697856f387f309f297a0527eab7f1057d15",
+  "patch": {
+    ".github/workflows/ci.yml": "name: agent-attempt\non: [push]\njobs:\n  bypass:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo forbidden\n"
+  },
+  "fix_patches": [],
+  "test_roots": [
+    "tests",
+    "backend/src/test/java"
+  ],
+  "notes": "T16 forbidden run: touching .github/ must be denied by the orbita diff-scope profile."
+}

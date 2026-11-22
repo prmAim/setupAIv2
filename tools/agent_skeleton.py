@@ -1,8 +1,9 @@
-"""Tracer-bullet prototype: fake edit engine, gates, evidence bundle, Langfuse spans."""
+"""Tracer-bullet prototype: edit engines, gates, idempotent publish, Langfuse spans."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
 import hashlib
 import json
@@ -13,11 +14,12 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections import defaultdict
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
-from langfuse import Langfuse
+from langfuse import Langfuse, propagate_attributes
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langsmith import tracing_context
@@ -31,6 +33,12 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 import test_integrity as ast_integrity  # noqa: E402  (tools dir is on sys.path above)
+from codex_engine import CodexEngine, CodexProfile  # noqa: E402
+from diff_scope import DEFAULT_PROFILE, DiffScopeRules, RuleHit  # noqa: E402
+from diff_scope import evaluate as evaluate_diff_scope  # noqa: E402
+from diff_scope import resolve_rules  # noqa: E402
+from patch_report import PatchReport  # noqa: E402
+from publish import GitHubClient, PublishConfig, Publisher  # noqa: E402
 
 ENGINE = "fake"
 MAX_FIX_ATTEMPTS = 3
@@ -58,17 +66,10 @@ class SkeletonError(RuntimeError):
     """A deterministic, non-secret failure raised by a graph node."""
 
 
-class PatchReport(BaseModel):
-    files_changed: list[str]
-    summary: str
-    engine: Literal["fake"] = ENGINE
-    cli_version: str | None = None
-
-
 class Plan(BaseModel):
     task_id: str
     steps: list[str]
-    strategy: Literal["fake-patch"] = "fake-patch"
+    strategy: Literal["fake-patch", "codex-patch"] = "fake-patch"
     expected_files: list[str]
     fix_attempts_allowed: int = 0
 
@@ -93,15 +94,25 @@ class TaskSpec(BaseModel):
     baseline_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     patch: dict[str, str]
     fix_patches: list[dict[str, str]] = Field(default_factory=list)
-    forbidden_paths: list[str] = Field(default_factory=lambda: list(DEFAULT_FORBIDDEN_PATHS))
+    forbidden_paths: list[str] | None = None
+    diff_scope_profile: str = DEFAULT_PROFILE
+    diff_scope_rules: DiffScopeRules | None = None
     test_roots: list[str] = Field(default_factory=lambda: list(DEFAULT_TEST_ROOTS))
     lint_command: list[str] = Field(default_factory=lambda: list(LINT_COMMAND))
     test_command: list[str] = Field(default_factory=lambda: list(TEST_COMMAND))
+    engine: Literal["fake", "codex"] = "fake"
+    codex: CodexProfile = Field(default_factory=CodexProfile)
+    publish: PublishConfig | None = None
     notes: str = ""
 
     @classmethod
     def load(cls, path: Path) -> TaskSpec:
         return cls.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def scoped_rules(self) -> DiffScopeRules:
+        if self.diff_scope_rules is not None:
+            return self.diff_scope_rules
+        return resolve_rules(profile=self.diff_scope_profile, explicit=self.forbidden_paths)
 
 
 class SkeletonState(TypedDict, total=False):
@@ -113,12 +124,16 @@ class SkeletonState(TypedDict, total=False):
     patch_report: dict[str, Any] | None
     gate_results: dict[str, dict[str, Any]]
     attempts: int
+    engine_calls: int
     evidence_paths: list[str]
     trace_id: str
+    session_id: str
+    previous_trace_id: str | None
     changed_files: list[str]
     verdict: str
     summary: str
     fix_history: list[str]
+    publish: dict[str, Any]
 
 
 class SkeletonSettings(BaseSettings):
@@ -164,6 +179,8 @@ def json_dump(path: Path, payload: Any) -> None:
         encoding="utf-8",
         newline="\n",
     )
+
+
 def git(repo: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", "-c", "core.quotepath=false", "-C", str(repo), *args],
@@ -222,13 +239,53 @@ class FakeEngine:
                 shutil.rmtree(cache, ignore_errors=True)
             written.append(relative.replace("\\", "/"))
         return PatchReport(files_changed=written, summary=summary, cli_version=None)
+class GitTool:
+    """Module-level git with one tool span per command."""
+
+    def __init__(self, repo: Path, recorder: "TraceRecorder", task_id: str) -> None:
+        self.repo = repo
+        self.recorder = recorder
+        self.task_id = task_id
+
+    def __call__(self, *args: str) -> str:
+        command = ["git", *args]
+        started = time.perf_counter()
+        completed = subprocess.run(
+            ["git", "-c", "core.quotepath=false", "-C", str(self.repo), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        self.recorder.tool(
+            name=f"git {args[0] if args else ''}".strip(),
+            cmd=command,
+            exit_code=completed.returncode,
+            duration_ms=duration_ms,
+            metadata={"task_id": self.task_id},
+        )
+        if completed.returncode != 0:
+            raise SkeletonError(
+                f"git {' '.join(args)} failed with exit {completed.returncode}: "
+                f"{completed.stderr.strip()[:400]}"
+            )
+        return completed.stdout
 
 
-def build_patch_text(repo: Path, baseline_sha: str, files: list[str]) -> str:
+def build_patch_text(
+    repo: Path,
+    baseline_sha: str,
+    files: list[str],
+    *,
+    git_runner: Callable[..., str] | None = None,
+) -> str:
+    runner = git_runner or (lambda *args: git(repo, *args))
     chunks: list[str] = []
     for relative in sorted(files):
         try:
-            old = git(repo, "show", f"{baseline_sha}:{relative}")
+            old = runner("show", f"{baseline_sha}:{relative}")
         except SkeletonError:
             old = ""
         current = safe_relative(repo, relative)
@@ -256,34 +313,49 @@ def build_patch_text(repo: Path, baseline_sha: str, files: list[str]) -> str:
     return "".join(chunks)
 
 
-def changed_files(repo: Path, baseline_sha: str) -> list[str]:
-    tracked = [line for line in git(repo, "diff", "--name-only", baseline_sha).splitlines() if line]
+def changed_files(
+    repo: Path,
+    baseline_sha: str,
+    *,
+    git_runner: Callable[..., str] | None = None,
+) -> list[str]:
+    runner = git_runner or (lambda *args: git(repo, *args))
+    tracked = [line for line in runner("diff", "--name-only", baseline_sha).splitlines() if line]
     untracked = [
-        line
-        for line in git(repo, "ls-files", "--others", "--exclude-standard").splitlines()
-        if line
+        line for line in runner("ls-files", "--others", "--exclude-standard").splitlines() if line
     ]
     return sorted({line.replace("\\", "/") for line in tracked + untracked})
 
 
 class TraceRecorder:
-    """Root span plus one child span per graph node, readable back by trace id."""
+    """Root span, node spans, engine generations, tool spans, session linkage."""
 
-    def __init__(self, settings: SkeletonSettings) -> None:
+    def __init__(
+        self,
+        settings: SkeletonSettings,
+        *,
+        client_factory: Callable[[SkeletonSettings], Any] | None = None,
+    ) -> None:
         self.note = "disabled"
-        self.client: Langfuse | None = None
+        self.client: Any = None
         self.trace_id = ""
+        self.session_id = ""
+        self.previous_trace_id: str | None = None
         self.root: Any = None
         self.span_names: set[str] = set()
+        self.emitted: list[dict[str, Any]] = []
+        os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+        os.environ["no_proxy"] = "localhost,127.0.0.1"
         public = settings.langfuse_public_key.get_secret_value().strip()
         secret = settings.langfuse_secret_key.get_secret_value().strip()
         if not settings.tracing:
             self.note = "disabled: tracing is off for this run"
+        elif client_factory is not None:
+            self.client = client_factory(settings)
+            self.note = "enabled: recording double"
         elif not public or not secret:
             self.note = "disabled: Langfuse keys are not configured"
         else:
-            os.environ["NO_PROXY"] = "localhost,127.0.0.1"
-            os.environ["no_proxy"] = "localhost,127.0.0.1"
             self.client = Langfuse(
                 public_key=public,
                 secret_key=secret,
@@ -294,34 +366,117 @@ class TraceRecorder:
             )
             self.note = "enabled"
 
+    @contextlib.contextmanager
+    def session(self, session_id: str) -> Iterator[None]:
+        self.session_id = session_id
+        if self.client is None:
+            yield
+            return
+        with propagate_attributes(session_id=session_id):
+            yield
+
+    def _emit(self, *, name: str, as_type: str, metadata: dict[str, Any]) -> None:
+        self.span_names.add(name)
+        self.emitted.append(
+            {
+                "name": name,
+                "type": as_type.upper(),
+                "trace_id": self.trace_id,
+                "session_id": self.session_id,
+                "metadata": metadata,
+            }
+        )
+
     def start(
-        self, *, name: str, metadata: dict[str, Any], input: Any, trace_id: str | None = None
+        self,
+        *,
+        name: str,
+        metadata: dict[str, Any],
+        input: Any,
+        session_id: str | None = None,
+        previous_trace_id: str | None = None,
+        trace_id: str | None = None,
     ) -> None:
-        seed = f"{metadata['task_id']}:{metadata['baseline_sha']}:{ENGINE}"
+        if session_id:
+            self.session_id = session_id
+        self.previous_trace_id = previous_trace_id
+        seed = f"{metadata['task_id']}:{metadata['baseline_sha']}:{metadata.get('engine')}"
+        seed = f"{seed}:{self.session_id}:{previous_trace_id}"
         if self.client is None:
             self.trace_id = trace_id or sha256_text(seed)[:32]
             return
-        self.trace_id = trace_id or self.client.create_trace_id()
+        self.trace_id = self.client.create_trace_id()
+        span_metadata = {
+            **metadata,
+            "session_id": self.session_id,
+            "previous_trace_id": self.previous_trace_id,
+        }
         self.root = self.client.start_observation(
             name=name,
             as_type="agent",
             trace_context={"trace_id": self.trace_id},
             input=input,
-            metadata={**metadata, "engine": ENGINE, "cli_version": "none"},
+            metadata=span_metadata,
         )
-        self.span_names.add(name)
+        self._emit(name=name, as_type="agent", metadata=span_metadata)
 
     def node(self, name: str, *, metadata: dict[str, Any], input: Any) -> Any:
         if self.client is None or self.root is None:
             return None
-        self.span_names.add(name)
-        return self.client.start_observation(
+        span = self.client.start_observation(
             name=name,
             as_type="chain",
             trace_context={"trace_id": self.trace_id, "parent_span_id": self.root.id},
             input=input,
-            metadata={**metadata, "engine": ENGINE, "node": name, "cli_version": "none"},
+            metadata={**metadata, "node": name},
         )
+        self._emit(name=name, as_type="chain", metadata={**metadata, "node": name})
+        return span
+
+    def generation(
+        self,
+        *,
+        name: str,
+        metadata: dict[str, Any],
+        input: Any,
+        output_bytes: int,
+    ) -> None:
+        payload = {**metadata, "output_bytes": int(output_bytes)}
+        if self.client is not None and self.root is not None:
+            span = self.client.start_observation(
+                name=name,
+                as_type="generation",
+                trace_context={"trace_id": self.trace_id, "parent_span_id": self.root.id},
+                input=input,
+                metadata=payload,
+            )
+            self.close(span, {"output_bytes": int(output_bytes)})
+        self._emit(name=name, as_type="generation", metadata=payload)
+
+    def tool(
+        self,
+        *,
+        name: str,
+        cmd: list[str],
+        exit_code: int,
+        duration_ms: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "cmd": list(cmd),
+            "exit": int(exit_code),
+            "duration_ms": int(duration_ms),
+            **(metadata or {}),
+        }
+        if self.client is not None and self.root is not None:
+            span = self.client.start_observation(
+                name=name,
+                as_type="tool",
+                trace_context={"trace_id": self.trace_id, "parent_span_id": self.root.id},
+                metadata=payload,
+            )
+            self.close(span, {"exit": int(exit_code), "duration_ms": int(duration_ms)})
+        self._emit(name=name, as_type="tool", metadata=payload)
 
     def close(self, span: Any, output: Any, *, error: str | None = None) -> None:
         if span is None:
@@ -335,35 +490,80 @@ class TraceRecorder:
     def finish(self, output: dict[str, Any]) -> None:
         self.close(self.root, output)
 
-    def read_back(self, *, environment: str, deadline_s: float = 30.0) -> dict[str, Any]:
+    def read_back(self, *, environment: str | None = None, deadline_s: float = 30.0) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "status": self.note,
+            "trace_id": self.trace_id,
+            "session_id": self.session_id,
+            "previous_trace_id": self.previous_trace_id,
+        }
         if self.client is None:
-            return {"status": self.note}
+            return summary
+        if not hasattr(self.client, "api"):
+            return {**summary, "status": "local-recorder", **self._summarise(self.emitted)}
         self.client.flush()
         deadline = time.monotonic() + deadline_s
         observations: list[Any] = []
         while True:
-            observations = self.client.api.observations.get_many(
-                trace_id=self.trace_id,
-                environment=environment,
-                fields="core,basic,io,model",
-                limit=100,
-            ).data
+            kwargs: dict[str, Any] = {
+                "session_id": self.session_id,
+                "fields": "core,basic,io,model,metadata",
+                "limit": 200,
+            }
+            if environment:
+                kwargs["environment"] = environment
+            observations = self.client.api.observations.get_many(**kwargs).data
             seen = {getattr(item, "name", "") for item in observations}
             if self.span_names.issubset(seen) or time.monotonic() >= deadline:
                 break
             time.sleep(2)
+        records = []
+        for item in observations:
+            data = item.model_dump() if hasattr(item, "model_dump") else {}
+            records.append(
+                {
+                    "name": data.get("name") or getattr(item, "name", ""),
+                    "type": str(data.get("type") or getattr(item, "type", "")),
+                    "trace_id": data.get("trace_id") or getattr(item, "trace_id", ""),
+                    "session_id": data.get("session_id") or getattr(item, "session_id", ""),
+                    "metadata": data.get("metadata"),
+                }
+            )
         return {
+            **summary,
             "status": "read-back",
             "trace_url": self.client.get_trace_url(trace_id=self.trace_id),
-            "observations": len(observations),
+            "observations": len(records),
             "expected_observations": len(self.span_names),
-            "observation_names": sorted(getattr(item, "name", "") for item in observations),
+            **self._summarise(records),
+        }
+
+    @staticmethod
+    def _summarise(records: list[dict[str, Any]]) -> dict[str, Any]:
+        traces: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"session_ids": set(), "types": set(), "names": []}
+        )
+        for item in records:
+            trace = traces[item["trace_id"]]
+            if item.get("session_id"):
+                trace["session_ids"].add(item["session_id"])
+            trace["types"].add(item["type"])
+            trace["names"].append(item["name"])
+        return {
+            "trace_ids": sorted(traces),
+            "traces": {
+                key: {
+                    "session_ids": sorted(value["session_ids"]),
+                    "types": sorted(value["types"]),
+                    "names": sorted(set(value["names"])),
+                }
+                for key, value in sorted(traces.items())
+            },
         }
 
     def shutdown(self) -> None:
-        if self.client is not None:
+        if self.client is not None and hasattr(self.client, "shutdown"):
             self.client.shutdown()
-
 
 class Runtime:
     """Shared, per-run context for graph nodes (task, settings, recorder)."""
@@ -382,13 +582,24 @@ class Runtime:
         self.sleep_in_test = sleep_in_test
         self.repo = task.repo.resolve()
         self.evidence = settings.evidence_root / task.task_id
-        self.engine = FakeEngine(self.repo)
+        self.rules = task.scoped_rules()
+        self.engine_name = task.engine
+        if task.engine == "codex":
+            self.engine: FakeEngine | CodexEngine = CodexEngine(
+                self.repo,
+                timeout_s=task.codex.timeout_s,
+                sandbox=task.codex.sandbox,
+                cli_version=task.codex.cli_version,
+            )
+        else:
+            self.engine = FakeEngine(self.repo)
+        self.git = GitTool(self.repo, recorder, task.task_id)
         self.metadata = {
             "task_id": task.task_id,
             "repo": str(self.repo),
             "baseline_sha": task.baseline_sha,
-            "engine": ENGINE,
-            "cli_version": "none",
+            "engine": task.engine,
+            "cli_version": task.codex.cli_version,
         }
 
     def record_gate(self, result: GateResult) -> dict[str, Any]:
@@ -430,6 +641,13 @@ class Runtime:
         output = (completed.stdout or "") + (completed.stderr or "")
         if log_name:
             (self.evidence / log_name).write_text(output, encoding="utf-8", newline="\n")
+        self.recorder.tool(
+            name=name,
+            cmd=list(command),
+            exit_code=completed.returncode,
+            duration_ms=duration_ms,
+            metadata={"task_id": self.task.task_id},
+        )
         tail = "\n".join(line for line in output.splitlines() if line.strip())[-1200:]
         result = GateResult(
             name=name,
@@ -447,8 +665,7 @@ class Runtime:
         for root in self.task.test_roots:
             normalized = root.replace("\\", "/").strip("/")
             try:
-                listing = git(
-                    self.repo,
+                listing = self.git(
                     "ls-tree",
                     "-r",
                     "--name-only",
@@ -478,8 +695,8 @@ class Runtime:
         ]
         baseline_set: set[str] = set()
         for root in self.task.test_roots:
-            listing = git(
-                self.repo, "ls-tree", "-r", "--name-only", self.task.baseline_sha, "--", root
+            listing = self.git(
+                "ls-tree", "-r", "--name-only", self.task.baseline_sha, "--", root
             )
             baseline_set.update(
                 line.replace("\\", "/") for line in listing.splitlines() if line.strip()
@@ -520,40 +737,82 @@ class Runtime:
             rule=", ".join(rules) if rules else None,
             findings=findings,
         )
-        return self.record_gate(result)
+        recorded = self.record_gate(result)
+        self.recorder.tool(
+            name="ast-test-integrity",
+            cmd=result.command,
+            exit_code=exit_code,
+            duration_ms=result.duration_ms,
+            metadata={"task_id": self.task.task_id},
+        )
+        return recorded
 
     def diff_scope(self) -> dict[str, Any]:
         started = time.perf_counter()
-        files = changed_files(self.repo, self.task.baseline_sha)
-        violations = [
-            f"{path} matches forbidden pattern {reason}"
-            for path in files
-            if (reason := is_forbidden(path, self.task.forbidden_paths))
-        ]
+        files = changed_files(self.repo, self.task.baseline_sha, git_runner=self.git)
+        hits: list[RuleHit] = evaluate_diff_scope(self.rules, files)
         detail = (
-            "; ".join(violations)
-            if violations
-            else f"{len(files)} changed files, none in forbidden paths"
+            "; ".join(f"{hit.path}: {hit.reason}" for hit in hits)
+            if hits
+            else f"{len(files)} changed files, none outside the allowed scope"
         )
+        rules = sorted({hit.rule for hit in hits})
         result = GateResult(
             name="diff-scope",
             command=["git", "diff", "--name-only", self.task.baseline_sha],
-            exit_code=1 if violations else 0,
+            exit_code=1 if hits else 0,
             duration_ms=int((time.perf_counter() - started) * 1000),
-            passed=not violations,
+            passed=not hits,
             detail=detail[:2000],
+            rule=", ".join(rules) if rules else None,
+            findings=[hit.model_dump() for hit in hits],
         )
         return self.record_gate(result)
 
     def apply_patch(self, patch: dict[str, str], summary: str) -> dict[str, Any]:
-        report = self.engine.apply(patch, summary=summary)
-        files = sorted(set(changed_files(self.repo, self.task.baseline_sha)) | set(report.files_changed))
+        prompt = json.dumps({"summary": summary, "files": sorted(patch)}, sort_keys=True)
+        prompt_sha = sha256_text(prompt)
+        started = time.perf_counter()
+        if isinstance(self.engine, CodexEngine):
+            report = self.engine.run(prompt, task_id=self.task.task_id)
+        else:
+            report = self.engine.apply(patch, summary=summary)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        self.recorder.generation(
+            name=f"engine:{self.task.task_id}:{len(self.recorder.emitted)}",
+            metadata={
+                "engine": report.engine,
+                "cli_version": report.cli_version or "none",
+                "prompt_sha256": prompt_sha,
+                "task_id": self.task.task_id,
+                "duration_ms": duration_ms,
+            },
+            input={"prompt_sha256": prompt_sha, "files": sorted(patch)},
+            output_bytes=len(report.model_dump_json().encode("utf-8")),
+        )
+        files = sorted(
+            set(changed_files(self.repo, self.task.baseline_sha, git_runner=self.git))
+            | set(report.files_changed)
+        )
         return {
             "patch_report": report.model_dump(mode="json"),
-            "diff": build_patch_text(self.repo, self.task.baseline_sha, files),
+            "diff": build_patch_text(
+                self.repo, self.task.baseline_sha, files, git_runner=self.git
+            ),
             "changed_files": files,
         }
 
+    def publisher(self, config: PublishConfig) -> Publisher:
+        def on_tool(command: list[str], exit_code: int, duration_ms: int) -> None:
+            self.recorder.tool(
+                name="git publish",
+                cmd=command,
+                exit_code=exit_code,
+                duration_ms=duration_ms,
+                metadata={"task_id": self.task.task_id},
+            )
+
+        return Publisher(self.repo, config, GitHubClient(), on_tool=on_tool)
 
 def build_graph(
     task: TaskSpec,
@@ -566,6 +825,7 @@ def build_graph(
     runtime = Runtime(task, settings, recorder, sleep_in_test=sleep_in_test)
     evidence = runtime.evidence
     metadata = runtime.metadata
+    publish_enabled = task.publish is not None
 
     def traced(
         name: str,
@@ -591,7 +851,7 @@ def build_graph(
         repo = runtime.repo
         if not (repo / ".git").exists():
             raise SkeletonError(f"target repository is not a git checkout: {repo}")
-        head = git(repo, "rev-parse", "HEAD").strip()
+        head = runtime.git("rev-parse", "HEAD").strip()
         if head != task.baseline_sha:
             raise SkeletonError(
                 f"baseline mismatch: HEAD {head[:12]} != task baseline {task.baseline_sha[:12]}"
@@ -602,6 +862,7 @@ def build_graph(
             "repo": str(repo),
             "baseline_sha": task.baseline_sha,
             "attempts": state.get("attempts", 0),
+            "engine_calls": state.get("engine_calls", 0),
             "gate_results": state.get("gate_results", {}),
             "evidence_paths": state.get("evidence_paths", []),
             "plan": None,
@@ -611,19 +872,45 @@ def build_graph(
             "verdict": "",
             "summary": "",
             "fix_history": [],
+            "publish": state.get("publish", {}),
         }
 
     def plan(state: SkeletonState) -> dict[str, Any]:
+        steps = ["ingest", "plan", f"edit({task.engine})", "fast_gate", "test", "gates", "evidence"]
+        if publish_enabled:
+            steps.extend(["push", "open_pr"])
         report = Plan(
             task_id=task.task_id,
-            steps=["ingest", "plan", "edit(fake)", "fast_gate", "test", "gates", "evidence"],
+            steps=steps,
+            strategy="codex-patch" if task.engine == "codex" else "fake-patch",
             expected_files=sorted(path.replace("\\", "/") for path in task.patch),
             fix_attempts_allowed=min(MAX_FIX_ATTEMPTS, len(task.fix_patches)),
         )
         return {"plan": report.model_dump(mode="json")}
 
     def edit(state: SkeletonState) -> dict[str, Any]:
-        return runtime.apply_patch(task.patch, f"{ENGINE} engine applied {len(task.patch)} file(s)")
+        update = runtime.apply_patch(
+            task.patch, f"{runtime.engine_name} engine applied {len(task.patch)} file(s)"
+        )
+        results = dict(state.get("gate_results", {}))
+        report = update["patch_report"]
+        if report.get("engine_error"):
+            results["engine"] = runtime.record_gate(
+                GateResult(
+                    name="engine",
+                    command=["engine", str(report.get("engine"))],
+                    exit_code=int(report.get("exit_code") or 1),
+                    duration_ms=int(report.get("duration_ms") or 0),
+                    passed=False,
+                    detail=(report.get("error_detail") or report["engine_error"])[:2000],
+                    rule=str(report["engine_error"]),
+                )
+            )
+        return {
+            **update,
+            "gate_results": results,
+            "engine_calls": int(state.get("engine_calls", 0)) + 1,
+        }
 
     def fast_gate(state: SkeletonState) -> dict[str, Any]:
         results = dict(state.get("gate_results", {}))
@@ -633,7 +920,9 @@ def build_graph(
 
     def run_tests(state: SkeletonState) -> dict[str, Any]:
         if runtime.sleep_in_test:
-            (evidence / ".test-node-started").write_text(str(os.getpid()), encoding="utf-8", newline="\n")
+            (evidence / ".test-node-started").write_text(
+                str(os.getpid()), encoding="utf-8", newline="\n"
+            )
             time.sleep(runtime.sleep_in_test)
         result = runtime.run_gate("tests", list(task.test_command), log_name="tests.log")
         results = dict(state.get("gate_results", {}))
@@ -643,12 +932,23 @@ def build_graph(
     def fix(state: SkeletonState) -> dict[str, Any]:
         attempts = int(state.get("attempts", 0))
         history = list(state.get("fix_history") or [])
-        if attempts >= len(task.fix_patches):
-            return {"attempts": attempts + 1, "fix_history": [*history, "no fix patch available"]}
+        allowed = min(MAX_FIX_ATTEMPTS, len(task.fix_patches))
+        if attempts >= allowed:
+            return {
+                "attempts": attempts,
+                "fix_history": [*history, "fix cap reached; no further engine call"],
+            }
         update = runtime.apply_patch(
-            task.fix_patches[attempts], f"{ENGINE} engine applied fix patch {attempts + 1}"
+            task.fix_patches[attempts],
+            f"{runtime.engine_name} engine applied fix patch {attempts + 1}",
         )
-        return {**update, "attempts": attempts + 1, "fix_history": [*history, f"fix patch {attempts + 1}"]}
+        return {
+            **update,
+            "attempts": attempts + 1,
+            "engine_calls": int(state.get("engine_calls", 0)) + 1,
+            "fix_history": [*history, f"fix patch {attempts + 1}"],
+        }
+
     def gates(state: SkeletonState) -> dict[str, Any]:
         results = dict(state.get("gate_results", {}))
         for result in (runtime.test_integrity(), runtime.diff_scope()):
@@ -669,6 +969,26 @@ def build_graph(
             ),
         }
 
+    def push(state: SkeletonState) -> dict[str, Any]:
+        result: dict[str, Any] = {"status": "skipped"}
+        if task.publish is None:
+            result["reason"] = "task has no publish config"
+        elif state.get("verdict") != "pass":
+            result["reason"] = f"verdict is {state.get('verdict') or 'missing'}"
+        else:
+            result = runtime.publisher(task.publish).push()
+        return {"publish": {**(state.get("publish") or {}), "push": result}}
+
+    def open_pr(state: SkeletonState) -> dict[str, Any]:
+        result: dict[str, Any] = {"status": "skipped"}
+        if task.publish is None:
+            result["reason"] = "task has no publish config"
+        elif state.get("verdict") != "pass":
+            result["reason"] = f"verdict is {state.get('verdict') or 'missing'}"
+        else:
+            result = runtime.publisher(task.publish).open_pr()
+        return {"publish": {**(state.get("publish") or {}), "open_pr": result}}
+
     def evidence_node(state: SkeletonState) -> dict[str, Any]:
         previous = evidence / "report.json"
         writes = 1
@@ -683,9 +1003,13 @@ def build_graph(
             marker.unlink()
         diff_text = state.get("diff", "")
         (evidence / "patch.diff").write_text(diff_text, encoding="utf-8", newline="\n")
-        (evidence / "patch.sha256").write_text(sha256_text(diff_text) + "\n", encoding="utf-8", newline="\n")
+        (evidence / "patch.sha256").write_text(
+            sha256_text(diff_text) + "\n", encoding="utf-8", newline="\n"
+        )
         files = sorted(set(state.get("changed_files") or []))
-        (evidence / "diff-name-only.txt").write_text("\n".join(files) + "\n", encoding="utf-8", newline="\n")
+        (evidence / "diff-name-only.txt").write_text(
+            "\n".join(files) + "\n", encoding="utf-8", newline="\n"
+        )
         gate_results = dict(state.get("gate_results", {}))
         for name in ("test-integrity", "diff-scope", "lint", "tests"):
             if name not in gate_results:
@@ -695,15 +1019,22 @@ def build_graph(
             + ["patch.diff", "patch.sha256", "diff-name-only.txt", "tests.log", "report.json"]
         )
         bundle = [name for name in bundle if (evidence / name).exists()]
+        patch_report = state.get("patch_report") or {}
+        scope_gate = gate_results.get("diff-scope") or {}
+        scope_verdict = "pass" if scope_gate.get("passed") else "deny"
         report = {
             "task_id": task.task_id,
             "repo": str(runtime.repo),
             "baseline_sha": task.baseline_sha,
-            "engine": ENGINE,
-            "cli_version": None,
+            "engine": patch_report.get("engine") or runtime.engine_name,
+            "cli_version": patch_report.get("cli_version"),
             "verdict": state.get("verdict") or "fail",
+            "diff_scope_verdict": scope_verdict,
             "attempts": int(state.get("attempts", 0)),
-            "trace_id": state.get("trace_id") or recorder.trace_id,
+            "engine_calls": int(state.get("engine_calls", 0)),
+            "trace_id": recorder.trace_id,
+            "previous_trace_id": recorder.previous_trace_id,
+            "session_id": recorder.session_id,
             "tracing": recorder.note,
             "plan": state.get("plan"),
             "patch_report": state.get("patch_report"),
@@ -712,11 +1043,16 @@ def build_graph(
             "gates": {name: item for name, item in sorted(gate_results.items())},
             "summary": state.get("summary", ""),
             "fix_history": state.get("fix_history") or [],
+            "publish": state.get("publish") or {},
             "evidence_paths": [str(evidence / name) for name in bundle],
             "evidence_writes": writes,
         }
         json_dump(previous, report)
         return {"evidence_paths": report["evidence_paths"], "verdict": report["verdict"]}
+
+    def after_edit(state: SkeletonState) -> str:
+        report = state.get("patch_report") or {}
+        return "escalate" if report.get("engine_error") else "fast_gate"
 
     def after_fast_gate(state: SkeletonState) -> str:
         gates_state = state.get("gate_results", {})
@@ -733,6 +1069,11 @@ def build_graph(
         if int(state.get("attempts", 0)) < allowed:
             return "fix"
         return "escalate"
+
+    def after_evidence(state: SkeletonState) -> str:
+        if publish_enabled and state.get("verdict") == "pass":
+            return "push"
+        return "end"
 
     nodes = {
         "ingest": traced(
@@ -784,6 +1125,16 @@ def build_graph(
             lambda update: {"files": len(update["evidence_paths"])},
             lambda state: {"verdict": state.get("verdict", "")},
         )(evidence_node),
+        "push": traced(
+            "push",
+            lambda update: update["publish"].get("push"),
+            lambda state: {"verdict": state.get("verdict", "")},
+        )(push),
+        "open_pr": traced(
+            "open_pr",
+            lambda update: update["publish"].get("open_pr"),
+            lambda state: {"verdict": state.get("verdict", "")},
+        )(open_pr),
     }
     builder = StateGraph(SkeletonState)
     for name, node in nodes.items():
@@ -791,7 +1142,9 @@ def build_graph(
     builder.add_edge(START, "ingest")
     builder.add_edge("ingest", "plan")
     builder.add_edge("plan", "edit")
-    builder.add_edge("edit", "fast_gate")
+    builder.add_conditional_edges(
+        "edit", after_edit, {"fast_gate": "fast_gate", "escalate": "escalate"}
+    )
     builder.add_conditional_edges(
         "fast_gate", after_fast_gate, {"test": "test", "escalate": "escalate"}
     )
@@ -801,7 +1154,9 @@ def build_graph(
     builder.add_edge("fix", "test")
     builder.add_edge("gates", "evidence")
     builder.add_edge("escalate", "evidence")
-    builder.add_edge("evidence", END)
+    builder.add_conditional_edges("evidence", after_evidence, {"push": "push", "end": END})
+    builder.add_edge("push", "open_pr")
+    builder.add_edge("open_pr", END)
     return builder.compile(checkpointer=checkpointer)
 
 def finalize_report(report_path: Path, updates: dict[str, Any]) -> dict[str, Any]:
@@ -818,15 +1173,16 @@ def run_graph(
     thread_id: str | None = None,
     resume: bool = False,
     sleep_in_test: float = 0.0,
+    recorder: TraceRecorder | None = None,
 ) -> dict[str, Any]:
     settings.state_db.parent.mkdir(parents=True, exist_ok=True)
-    recorder = TraceRecorder(settings)
+    recorder = recorder or TraceRecorder(settings)
     metadata = {
         "task_id": task.task_id,
         "repo": str(task.repo.resolve()),
         "baseline_sha": task.baseline_sha,
-        "engine": ENGINE,
-        "cli_version": "none",
+        "engine": task.engine,
+        "cli_version": task.codex.cli_version,
     }
     connection = sqlite3.connect(settings.state_db, check_same_thread=False)
     config = {"configurable": {"thread_id": thread_id or task.task_id}, "recursion_limit": 60}
@@ -846,45 +1202,55 @@ def run_graph(
                 "has_values": bool(snapshot.values),
             }
         previous_trace = (snapshot.values.get("trace_id") if snapshot else None) or None
-        recorder.start(
-            name=f"tracer-bullet:{task.task_id}",
-            metadata=metadata,
-            input={"thread_id": thread_id or task.task_id, "patch": sorted(task.patch)},
-            trace_id=previous_trace,
-        )
-        with tracing_context(enabled=False):
-            if resume:
-                app.invoke(None, config)
-            else:
-                app.invoke(
-                    {
-                        "trace_id": recorder.trace_id,
-                        "attempts": 0,
-                        "gate_results": {},
-                        "evidence_paths": [],
-                        "verdict": "",
-                        "fix_history": [],
+        with recorder.session(task.task_id):
+            recorder.start(
+                name=f"tracer-bullet:{task.task_id}",
+                metadata=metadata,
+                input={"thread_id": thread_id or task.task_id, "patch": sorted(task.patch)},
+                session_id=task.task_id,
+                previous_trace_id=previous_trace,
+            )
+            with tracing_context(enabled=False):
+                if resume:
+                    app.invoke(None, config)
+                else:
+                    app.invoke(
+                        {
+                            "trace_id": recorder.trace_id,
+                            "session_id": task.task_id,
+                            "previous_trace_id": None,
+                            "attempts": 0,
+                            "engine_calls": 0,
+                            "gate_results": {},
+                            "evidence_paths": [],
+                            "verdict": "",
+                            "fix_history": [],
+                            "publish": {},
+                        },
+                        config,
+                    )
+            values = app.get_state(config).values
+            report_path = settings.evidence_root / task.task_id / "report.json"
+            recorder.finish(
+                {
+                    "verdict": values.get("verdict"),
+                    "attempts": values.get("attempts"),
+                    "engine_calls": values.get("engine_calls"),
+                    "gates": {
+                        name: item["exit_code"]
+                        for name, item in (values.get("gate_results") or {}).items()
                     },
-                    config,
-                )
-        values = app.get_state(config).values
-        report_path = settings.evidence_root / task.task_id / "report.json"
-        recorder.finish(
-            {
-                "verdict": values.get("verdict"),
-                "attempts": values.get("attempts"),
-                "gates": {
-                    name: item["exit_code"]
-                    for name, item in (values.get("gate_results") or {}).items()
-                },
-            }
-        )
+                }
+            )
         trace_info = recorder.read_back(environment=settings.langfuse_environment)
         return finalize_report(
             report_path,
             {
                 "trace_id": recorder.trace_id,
+                "previous_trace_id": previous_trace,
+                "session_id": task.task_id,
                 "trace": trace_info,
+                "publish": values.get("publish") or {},
                 "checkpoints": sum(1 for _ in app.get_state_history(config)),
                 "resume": resume_info or None,
             },
@@ -930,7 +1296,10 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "verdict": report.get("verdict"),
                 "attempts": report.get("attempts"),
+                "engine_calls": report.get("engine_calls"),
                 "trace_id": report.get("trace_id"),
+                "trace_ids": (report.get("trace") or {}).get("trace_ids"),
+                "session_id": report.get("session_id"),
                 "evidence": str(settings.evidence_root / task.task_id),
                 "gates": {
                     name: item["exit_code"] for name, item in (report.get("gates") or {}).items()

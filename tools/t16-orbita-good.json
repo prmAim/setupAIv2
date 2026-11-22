@@ -1,0 +1,15 @@
+{
+  "task_id": "t16-orbita-good",
+  "repo": "C:\\Git\\_wf\\t16-run",
+  "baseline_sha": "f16e5697856f387f309f297a0527eab7f1057d15",
+  "patch": {
+    "tools/skeleton_ping.py": "\"\"\"Harmless helper added by the tracer-bullet prototype run.\"\"\"\n\n\ndef ping(name: str = \"orbita\") -> str:\n    \"\"\"Return a deterministic greeting without side effects.\"\"\"\n    return f\"pong:{name}\"\n",
+    "tests/test_skeleton_ping.py": "import unittest\n\nfrom tools.skeleton_ping import ping\n\n\nclass SkeletonPingTests(unittest.TestCase):\n    def test_ping_is_deterministic(self):\n        self.assertEqual(ping(\"tracer\"), \"pong:tracer\")\n\n    def test_ping_defaults_to_orbita(self):\n        self.assertEqual(ping(), \"pong:orbita\")\n"
+  },
+  "fix_patches": [],
+  "test_roots": [
+    "tests",
+    "backend/src/test/java"
+  ],
+  "notes": "T16 good run: allowed tools/ and tests/ patch, orbita diff-scope profile."
+}
