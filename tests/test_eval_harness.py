@@ -7,6 +7,7 @@ orbita, so the whole file runs offline in a few seconds.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -257,6 +258,13 @@ class SandboxIsolationTests(EvalHarnessFixture):
         self.assertEqual(harness.git(dest, "remote", "-v"), "")
 
 
+QUOTA_STUB = (
+    "@echo off\r\n"
+    "echo ERROR: usage limit reached. Please try again at 2026-11-23T18:04:00Z >&2\r\n"
+    "exit /b 1\r\n"
+)
+
+
 class ControlMatrixTests(EvalHarnessFixture):
     @classmethod
     def setUpClass(cls) -> None:
@@ -269,8 +277,24 @@ class ControlMatrixTests(EvalHarnessFixture):
                 paths=cls.paths,
                 report_ts="unit",
             )
-            for mode in ("gold", "noop", "cheat", "codex")
+            for mode in ("gold", "noop", "cheat")
         }
+        stub = Path(cls._temp.name) / "codex-quota.cmd"
+        stub.write_text(QUOTA_STUB, encoding="utf-8")
+        codex_paths = dataclasses.replace(
+            cls.paths,
+            codex=harness.CodexOptions(
+                binary=str(stub),
+                timeout_s=30,
+                env={"CODEX_CONFIG_FILE": str(Path(cls._temp.name) / "no-config.toml")},
+            ),
+        )
+        cls.cases["codex"] = harness.run_control(
+            task=task,
+            mode="codex",
+            paths=codex_paths,
+            report_ts="unit",
+        )
 
     def test_agent_work_precedes_hidden_tests(self) -> None:
         case = self.cases["gold"]
@@ -309,11 +333,29 @@ class ControlMatrixTests(EvalHarnessFixture):
         self.assertIn("test-file-modified", rules)
         self.assertEqual(case["hidden_tests"]["tests_patch_exit"], 0)
 
-    def test_codex_mode_reports_not_run(self) -> None:
+    def test_codex_quota_is_not_run_not_fail(self) -> None:
         case = self.cases["codex"]
         self.assertEqual(case["verdict"], "not_run")
-        self.assertEqual(case["reason"], "engine:codex_disabled")
+        self.assertEqual(case["reason"], "engine:quota_exhausted")
+        self.assertTrue(case["not_run"])
+        self.assertTrue(case["incomplete"])
+        self.assertFalse(case["resolved"])
         self.assertIsNone(case["harness_error"])
+        self.assertTrue(case["engine"]["infrastructure"])
+        self.assertEqual(case["engine"]["reset_at_utc"], "2026-11-23T18:04:00Z")
+        self.assertIn("hidden-skipped", case["order"])
+        self.assertIsNone(case["hidden_tests"]["exit_code"])
+
+    def test_codex_quota_does_not_enter_the_failure_count(self) -> None:
+        cases = list(self.cases.values())
+        counts = harness.summarize_cases(cases)
+        self.assertEqual(counts["resolved"], 1)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["intrusion"], 1)
+        self.assertEqual(counts["not_run"], 1)
+        self.assertTrue(counts["incomplete"])
+        # the noop/cheat cases still fail the matrix, but the quota run is not "failed"
+        self.assertEqual(harness.exit_code_for(cases, []), harness.EXIT_FAILURES)
 
     def test_control_matrix_matches_expectations(self) -> None:
         cases = [self.cases[mode] for mode in ("gold", "noop", "cheat")]
@@ -328,7 +370,73 @@ class ControlMatrixTests(EvalHarnessFixture):
         payload = json.loads(Path(written["json"]).read_text(encoding="utf-8"))
         self.assertEqual(payload["mismatches"], [])
         self.assertEqual(len(payload["runs"]), 3)
-        self.assertIn("History isolation", Path(written["markdown"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["counts"],
+            {
+                "total": 3,
+                "resolved": 1,
+                "failed": 1,
+                "not_run": 0,
+                "intrusion": 1,
+                "harness_errors": 0,
+                "incomplete": False,
+            },
+        )
+        self.assertEqual(payload["exit_code"], harness.EXIT_FAILURES)
+        self.assertFalse(payload["incomplete"])
+        markdown = Path(written["markdown"]).read_text(encoding="utf-8")
+        self.assertIn("History isolation", markdown)
+        self.assertIn("## Counters", markdown)
+
+    def test_incomplete_report_when_codex_never_ran(self) -> None:
+        cases = list(self.cases.values())
+        digests = self.golden.record_digests(self.paths.report_root / "golden-digests.json")
+        written = harness.write_report(
+            paths=self.paths, report_ts="unit-codex", cases=cases, digests=digests
+        )
+        payload = json.loads(Path(written["json"]).read_text(encoding="utf-8"))
+        self.assertTrue(payload["incomplete"])
+        self.assertEqual(payload["counts"]["not_run"], 1)
+        markdown = Path(written["markdown"]).read_text(encoding="utf-8")
+        self.assertIn("not_run because quota_exhausted", markdown)
+        self.assertIn("2026-11-23T18:04:00Z", markdown)
+
+
+class ExitCodeTests(unittest.TestCase):
+    def case(self, verdict: str, *, intrusion: bool = False, harness_error=None) -> dict:
+        return {
+            "verdict": verdict,
+            "test_integrity": {"test_intrusion": intrusion},
+            "harness_error": harness_error,
+        }
+
+    def test_clean_run_exits_zero(self) -> None:
+        cases = [self.case("resolved")]
+        self.assertEqual(harness.exit_code_for(cases, []), harness.EXIT_OK)
+
+    def test_agent_failure_exits_one(self) -> None:
+        cases = [self.case("resolved"), self.case("fail")]
+        self.assertEqual(harness.exit_code_for(cases, []), harness.EXIT_FAILURES)
+
+    def test_infrastructure_only_exits_three(self) -> None:
+        cases = [self.case("resolved"), self.case("not_run")]
+        self.assertEqual(harness.exit_code_for(cases, []), harness.EXIT_INCOMPLETE)
+        counts = harness.summarize_cases(cases)
+        self.assertEqual(counts["failed"], 0)
+        self.assertEqual(counts["not_run"], 1)
+        self.assertTrue(counts["incomplete"])
+
+    def test_failure_beats_incomplete(self) -> None:
+        cases = [self.case("not_run"), self.case("fail")]
+        self.assertEqual(harness.exit_code_for(cases, []), harness.EXIT_FAILURES)
+        self.assertEqual(harness.exit_code_for(cases, ["mismatch"]), harness.EXIT_FAILURES)
+
+    def test_harness_error_marks_incomplete(self) -> None:
+        cases = [self.case("resolved", harness_error="boom")]
+        counts = harness.summarize_cases(cases)
+        self.assertEqual(counts["harness_errors"], 1)
+        self.assertTrue(counts["incomplete"])
+        self.assertEqual(harness.exit_code_for(cases, []), harness.EXIT_INCOMPLETE)
 
 
 if __name__ == "__main__":

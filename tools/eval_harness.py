@@ -48,8 +48,9 @@ from agent_skeleton import (  # noqa: E402
     build_patch_text,
     changed_files,
 )
+from codex_engine import DEFAULT_CODEX_BIN, DEFAULT_TIMEOUT_S, CodexEngine  # noqa: E402
 from container_test_runner import ContainerTestRunner  # noqa: E402
-from patch_report import PatchReport  # noqa: E402
+from patch_report import INFRASTRUCTURE_ERRORS, PatchReport  # noqa: E402
 
 GOLDEN_DIR = "eval/golden"
 DEFAULT_REF = "research/golden-5"
@@ -485,6 +486,15 @@ def git_apply(repo: Path, patch: bytes, *, label: str, timeout_s: int = 300) -> 
         "passed": outcome.exit_code == 0,
     }
 
+@dataclasses.dataclass(frozen=True)
+class CodexOptions:
+    """Where the real engine comes from; ``None`` means "use the pinned default"."""
+
+    binary: str | None = None
+    model: str | None = None
+    timeout_s: int = DEFAULT_TIMEOUT_S
+    env: dict[str, str] | None = None
+
 class EvalEngine:
     """Engine surface used by the eval graph (one apply, one PatchReport)."""
 
@@ -587,24 +597,47 @@ class CheatEngine(EvalEngine):
         )
 
 
+def codex_prompt(issue: str) -> str:
+    """Instructions for the edit engine: the issue, then the JSON contract."""
+    return (
+        "You are the edit engine of an isolated repository snapshot.\n"
+        "Read `issue.md` in the current directory and make the smallest source change that "
+        "satisfies it. Never modify or add test files, and do not use the network.\n"
+        "When finished, reply with exactly one JSON object matching the provided schema: "
+        "files_changed (repository-relative paths you touched), summary, tests_added, notes.\n\n"
+        "--- issue.md ---\n"
+        f"{issue}\n"
+    )
+
+
 class CodexEvalEngine(EvalEngine):
-    """Real engine adapter is deliberately disabled until the quota resets (#2)."""
+    """Real Codex CLI engine; failures stay values so the meter can tell them apart."""
 
     name = "codex"
 
-    def apply(self, repo: Path) -> PatchReport:
-        return PatchReport(
-            engine="codex",
-            summary="codex engine is disabled",
-            engine_error="codex_disabled",
-            error_detail=(
-                "Real Codex runs stay off in this prototype: the subscription quota is "
-                "reserved for #10 (see #2). Gold/noop/cheat prove the meter instead."
-            ),
-            exit_code=None,
-            duration_ms=0,
-        )
+    def __init__(
+        self,
+        *,
+        binary: str | None = None,
+        model: str | None = None,
+        timeout_s: int = DEFAULT_TIMEOUT_S,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        self.binary = binary
+        self.model = model
+        self.timeout_s = timeout_s
+        self.env = env
 
+    def apply(self, repo: Path) -> PatchReport:
+        engine = CodexEngine(
+            repo,
+            binary=self.binary,
+            model=self.model,
+            timeout_s=self.timeout_s,
+            env=self.env,
+        )
+        issue = (repo / "issue.md").read_text(encoding="utf-8", errors="replace")
+        return engine.run(codex_prompt(issue), task_id=repo.name)
 
 def status_entries(repo: Path, roots: Sequence[str]) -> list[tuple[str, str]]:
     if not roots:
@@ -934,8 +967,9 @@ def build_eval_graph(context: CaseContext):
             "order": [*state.get("order", []), "agent"],
         }
         if payload.get("engine_error"):
-            update["verdict"] = "not_run" if context.mode == "codex" else "fail"
-            update["reason"] = f"engine:{payload['engine_error']}"
+            error = str(payload["engine_error"])
+            update["verdict"] = "not_run" if error in INFRASTRUCTURE_ERRORS else "fail"
+            update["reason"] = f"engine:{error}"
         return update
 
     def integrity(state: EvalState) -> dict[str, Any]:
@@ -1097,6 +1131,8 @@ def run_case(context: CaseContext) -> dict[str, Any]:
         "verdict": verdict,
         "reason": state.get("reason") or "",
         "resolved": verdict == "resolved",
+        "not_run": verdict == "not_run",
+        "incomplete": verdict == "not_run" or bool(harness_error),
         "iterations": 1 if patch_report else 0,
         "engine_calls": 1 if patch_report else 0,
         "wall_ms": wall_ms,
@@ -1108,8 +1144,14 @@ def run_case(context: CaseContext) -> dict[str, Any]:
             "name": context.engine.name,
             "summary": patch_report.get("summary"),
             "files_changed": patch_report.get("files_changed"),
+            "tests_added": patch_report.get("tests_added") or [],
+            "notes": patch_report.get("notes") or [],
+            "cli_version": patch_report.get("cli_version"),
             "error": patch_report.get("engine_error"),
             "detail": patch_report.get("error_detail"),
+            "infrastructure": patch_report.get("engine_error") in INFRASTRUCTURE_ERRORS,
+            "reset_at": patch_report.get("reset_at"),
+            "reset_at_utc": patch_report.get("reset_at_utc"),
         },
         "isolation": {
             "passed": isolation.get("passed", False),
@@ -1164,7 +1206,12 @@ def pick_cheat_target(repo: Path, commit: str, roots: Sequence[str]) -> str:
 
 
 def make_engine(
-    mode: str, *, task: GoldenTask, sandbox: Sandbox, roots: Sequence[str]
+    mode: str,
+    *,
+    task: GoldenTask,
+    sandbox: Sandbox,
+    roots: Sequence[str],
+    codex: CodexOptions | None = None,
 ) -> EvalEngine:
     if mode == "gold":
         return GoldEngine(task.gold_patch, parse_patch_paths(task.gold_patch))
@@ -1173,7 +1220,13 @@ def make_engine(
     if mode == "cheat":
         return CheatEngine(pick_cheat_target(sandbox.path, sandbox.baseline_commit, roots))
     if mode == "codex":
-        return CodexEvalEngine()
+        options = codex or CodexOptions()
+        return CodexEvalEngine(
+            binary=options.binary,
+            model=options.model,
+            timeout_s=options.timeout_s,
+            env=options.env,
+        )
     raise HarnessError(f"unknown mode: {mode!r}")
 
 
@@ -1189,6 +1242,8 @@ class HarnessPaths:
     java_home: Path | None = DEFAULT_JAVA_HOME
     hidden_timeout_s: int = 1800
     full_timeout_s: int = 1800
+    codex: CodexOptions = dataclasses.field(default_factory=CodexOptions)
+
 
 
 def run_control(
@@ -1213,7 +1268,9 @@ def run_control(
         issue=task.issue,
     )
     (evidence / "issue.md").write_bytes(task.issue)
-    engine = make_engine(mode, task=task, sandbox=sandbox, roots=task.test_roots)
+    engine = make_engine(
+        mode, task=task, sandbox=sandbox, roots=task.test_roots, codex=paths.codex
+    )
     context = CaseContext(
         task=task,
         mode=mode,
@@ -1292,6 +1349,29 @@ def render_markdown(
                 hidden=case["hidden_tests"]["exit_code"],
             )
         )
+    counts = summarize_cases(cases)
+    lines.extend(
+        [
+            "",
+            "## Counters",
+            "",
+            f"- resolved: {counts['resolved']}",
+            f"- failed: {counts['failed']}",
+            f"- not_run (infrastructure): {counts['not_run']}",
+            f"- test intrusion: {counts['intrusion']}",
+            f"- harness errors: {counts['harness_errors']}",
+            f"- incomplete: {counts['incomplete']}",
+            "",
+        ]
+    )
+    for case in cases:
+        engine = case.get("engine") or {}
+        if engine.get("error") and engine.get("infrastructure"):
+            lines.append(
+                f"- task {case['task']} {case['mode']}: not_run because "
+                f"{engine['error']}"
+                + (f" (reset {engine['reset_at_utc']})" if engine.get("reset_at_utc") else "")
+            )
     lines.extend(["", "## History isolation", ""])
     for case in cases:
         isolation = case["isolation"]
@@ -1347,6 +1427,52 @@ def render_markdown(
     return "\n".join(lines) + "\n"
 
 
+EXIT_OK = 0
+EXIT_FAILURES = 1
+EXIT_INCOMPLETE = 3
+"""Exit codes: 1 means the agent failed somewhere, 3 means conditions were not met.
+
+An ``incomplete`` run must never be reported as either a win or a loss: the
+shadow-mode metric only counts runs where the engine actually ran.
+"""
+
+
+def summarize_cases(cases: Sequence[dict[str, Any]]) -> dict[str, int | bool]:
+    counts: dict[str, int | bool] = {
+        "total": len(cases),
+        "resolved": 0,
+        "failed": 0,
+        "not_run": 0,
+        "intrusion": 0,
+        "harness_errors": 0,
+    }
+    for case in cases:
+        verdict = case.get("verdict")
+        intrusion = bool((case.get("test_integrity") or {}).get("test_intrusion"))
+        if verdict == "resolved":
+            counts["resolved"] += 1
+        elif intrusion:
+            counts["intrusion"] += 1
+        elif verdict == "not_run":
+            counts["not_run"] += 1
+        else:
+            counts["failed"] += 1
+        if case.get("harness_error"):
+            counts["harness_errors"] += 1
+    counts["incomplete"] = bool(counts["not_run"] or counts["harness_errors"])
+    return counts
+
+
+def exit_code_for(cases: Sequence[dict[str, Any]], mismatches: Sequence[str]) -> int:
+    if mismatches:
+        return EXIT_FAILURES
+    counts = summarize_cases(cases)
+    if counts["failed"] or counts["intrusion"]:
+        return EXIT_FAILURES
+    if counts["incomplete"]:
+        return EXIT_INCOMPLETE
+    return EXIT_OK
+
 def write_report(
     *,
     paths: HarnessPaths,
@@ -1354,6 +1480,7 @@ def write_report(
     cases: Sequence[dict[str, Any]],
     digests: dict[str, Any],
 ) -> dict[str, str]:
+    mismatches = check_expectations(cases)
     payload = {
         "report_ts": report_ts,
         "golden_ref": paths.ref,
@@ -1361,11 +1488,15 @@ def write_report(
         "orbita_repo": str(paths.orbita),
         "meter": {
             "resolved": "hidden tests exit 0 AND test-integrity pass AND no test-intrusion",
+            "not_run": "engine failed for infrastructure reasons (quota/auth/network/timeout)",
             "expected": EXPECTED,
         },
         "digests": digests,
         "runs": list(cases),
-        "mismatches": check_expectations(cases),
+        "counts": summarize_cases(cases),
+        "incomplete": summarize_cases(cases)["incomplete"],
+        "exit_code": exit_code_for(cases, mismatches),
+        "mismatches": mismatches,
     }
     root = paths.report_root
     json_path = root / f"report-{report_ts}.json"
@@ -1415,6 +1546,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--hidden-timeout", type=int, default=1800)
     run.add_argument("--full-verify", default="", help="task number that also runs the full gate")
     run.add_argument("--full-timeout", type=int, default=1800)
+    run.add_argument("--codex-bin", default=None, help=f"default: $CODEX_BIN or {DEFAULT_CODEX_BIN}")
+    run.add_argument("--codex-model", default=None, help="default: $CODEX_MODEL or config.toml")
+    run.add_argument("--codex-timeout", type=int, default=DEFAULT_TIMEOUT_S)
     run.add_argument("--keep-sandboxes", action="store_true")
     run.add_argument("--report-ts", default=None)
     args = parser.parse_args(argv)
@@ -1457,6 +1591,11 @@ def main(argv: list[str] | None = None) -> int:
         java_home=args.java_home,
         hidden_timeout_s=args.hidden_timeout,
         full_timeout_s=args.full_timeout,
+        codex=CodexOptions(
+            binary=args.codex_bin,
+            model=args.codex_model,
+            timeout_s=args.codex_timeout,
+        ),
     )
     full_verify_task = int(args.full_verify) if args.full_verify.strip() else None
     cases: list[dict[str, Any]] = []
@@ -1491,19 +1630,23 @@ def main(argv: list[str] | None = None) -> int:
             cases.append(case)
     written = write_report(paths=paths, report_ts=report_ts, cases=cases, digests=digests)
     mismatches = check_expectations(cases)
+    counts = summarize_cases(cases)
+    exit_code = exit_code_for(cases, mismatches)
     print(
         json.dumps(
             {
                 "report": written,
                 "runs": len(cases),
-                "resolved": sum(1 for case in cases if case["resolved"]),
+                "counts": counts,
+                "incomplete": counts["incomplete"],
                 "mismatches": mismatches,
+                "exit_code": exit_code,
             },
             ensure_ascii=False,
             indent=2,
         )
     )
-    return 0 if not mismatches else 1
+    return exit_code
 
 
 if __name__ == "__main__":
