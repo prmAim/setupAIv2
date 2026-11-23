@@ -1,0 +1,17 @@
+{
+  "task_id": "t23-orbita-good",
+  "repo": "C:\\Git\\_wf\\t23-run",
+  "baseline_sha": "f16e5697856f387f309f297a0527eab7f1057d15",
+  "patch": {
+    "tools/t23_ping.py": "\"\"\"Harmless helper added by the t23 container-gate run.\"\"\"\n\n\ndef ping(name: str = \"orbita\") -> str:\n    \"\"\"Return a deterministic greeting without side effects.\"\"\"\n    return f\"pong:{name}\"\n",
+    "tests/test_t23_ping.py": "import unittest\n\nfrom tools.t23_ping import ping\n\n\nclass T23PingTests(unittest.TestCase):\n    def test_ping_is_deterministic(self):\n        self.assertEqual(ping(\"t23\"), \"pong:t23\")\n\n    def test_ping_defaults(self):\n        self.assertEqual(ping(), \"pong:orbita\")\n"
+  },
+  "fix_patches": [],
+  "test_roots": ["tests", "backend/src/test/java"],
+  "runner": {
+    "run_id": "t23-orbita-good",
+    "fast_timeout_s": 300,
+    "full_timeout_s": 1200
+  },
+  "notes": "T23 good run: fast and full gates execute inside the runner container (DinD sidecar)."
+}

@@ -34,6 +34,7 @@ if str(TOOLS) not in sys.path:
 
 import test_integrity as ast_integrity  # noqa: E402  (tools dir is on sys.path above)
 from codex_engine import CodexEngine, CodexProfile  # noqa: E402
+from container_test_runner import ContainerTestRunner  # noqa: E402
 from diff_scope import DEFAULT_PROFILE, DiffScopeRules, RuleHit  # noqa: E402
 from diff_scope import evaluate as evaluate_diff_scope  # noqa: E402
 from diff_scope import resolve_rules  # noqa: E402
@@ -84,6 +85,22 @@ class GateResult(BaseModel):
     evidence: str | None = None
     rule: str | None = None
     findings: list[dict[str, str]] = Field(default_factory=list)
+    verdict: str | None = None
+    container_id: str | None = None
+    image_id: str | None = None
+    platform: str | None = None
+    log_path: str | None = None
+
+
+class RunnerConfig(BaseModel):
+    """Container execution for the test/full gates (ticket #23)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str | None = None
+    fast_timeout_s: int = Field(default=300, ge=1)
+    full_timeout_s: int = Field(default=1200, ge=1)
+    full: bool = True
 
 
 class TaskSpec(BaseModel):
@@ -102,6 +119,7 @@ class TaskSpec(BaseModel):
     test_command: list[str] = Field(default_factory=lambda: list(TEST_COMMAND))
     engine: Literal["fake", "codex"] = "fake"
     codex: CodexProfile = Field(default_factory=CodexProfile)
+    runner: RunnerConfig | None = None
     publish: PublishConfig | None = None
     notes: str = ""
 
@@ -575,12 +593,23 @@ class Runtime:
         recorder: TraceRecorder,
         *,
         sleep_in_test: float = 0.0,
+        runner_factory: Callable[[TaskSpec, Path], ContainerTestRunner | None] | None = None,
     ) -> None:
         self.task = task
         self.settings = settings
         self.recorder = recorder
         self.sleep_in_test = sleep_in_test
         self.repo = task.repo.resolve()
+        self.runner: ContainerTestRunner | None = None
+        if task.runner is not None:
+            if runner_factory is not None:
+                self.runner = runner_factory(task, self.repo)
+            else:
+                self.runner = ContainerTestRunner(
+                    run_id=task.runner.run_id or task.task_id,
+                    repo_path=self.repo,
+                    profile="fast",
+                )
         self.evidence = settings.evidence_root / task.task_id
         self.rules = task.scoped_rules()
         self.engine_name = task.engine
@@ -616,6 +645,7 @@ class Runtime:
                 duration_ms=0,
                 passed=False,
                 detail=reason,
+                verdict="not_run",
             )
         )
 
@@ -658,6 +688,58 @@ class Runtime:
             detail=tail,
         )
         return self.record_gate(result)
+
+    def run_container_gate(
+        self,
+        name: str,
+        profile: str,
+        *,
+        timeout_s: int,
+        log_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a profile gate inside the runner container and record its evidence."""
+        assert self.runner is not None
+        command = self.runner.command_for(profile)
+        log_path = self.evidence / (log_name or f"{name}.log")
+        result = self.runner.run_profile(profile, timeout_s=timeout_s, log_path=log_path)
+        cmd = ["docker", "exec", result.container_id or "-", "bash", "-lc", command]
+        self.recorder.tool(
+            name=name,
+            cmd=cmd,
+            exit_code=result.exit_code,
+            duration_ms=result.duration_ms,
+            metadata={
+                "task_id": self.task.task_id,
+                "container_id": result.container_id,
+                "image_id": result.image_id,
+                "platform": result.platform,
+                "verdict": result.verdict,
+            },
+        )
+        if result.verdict == "not_run":
+            detail = result.reason[:1200]
+        else:
+            detail = "\n".join(line for line in result.output_tail.splitlines() if line.strip())[
+                -1200:
+            ]
+        gate = GateResult(
+            name=name,
+            command=cmd,
+            exit_code=result.exit_code,
+            duration_ms=result.duration_ms,
+            passed=result.verdict == "pass",
+            detail=detail,
+            verdict=result.verdict,
+            container_id=result.container_id,
+            image_id=result.image_id,
+            platform=result.platform,
+            log_path=result.log_path,
+        )
+        return self.record_gate(gate)
+
+    def close(self) -> None:
+        if self.runner is not None:
+            self.runner.stop(cleanup=True)
 
     def test_paths(self) -> list[str]:
         """Test files under ``test_roots`` in the baseline and the working tree."""
@@ -821,8 +903,16 @@ def build_graph(
     *,
     checkpointer: Any = None,
     sleep_in_test: float = 0.0,
+    runtime: Runtime | None = None,
+    runner_factory: Callable[[TaskSpec, Path], ContainerTestRunner | None] | None = None,
 ):
-    runtime = Runtime(task, settings, recorder, sleep_in_test=sleep_in_test)
+    runtime = runtime or Runtime(
+        task,
+        settings,
+        recorder,
+        sleep_in_test=sleep_in_test,
+        runner_factory=runner_factory,
+    )
     evidence = runtime.evidence
     metadata = runtime.metadata
     publish_enabled = task.publish is not None
@@ -924,7 +1014,13 @@ def build_graph(
                 str(os.getpid()), encoding="utf-8", newline="\n"
             )
             time.sleep(runtime.sleep_in_test)
-        result = runtime.run_gate("tests", list(task.test_command), log_name="tests.log")
+        if runtime.runner is None:
+            result = runtime.run_gate("tests", list(task.test_command), log_name="tests.log")
+        else:
+            fast_timeout = task.runner.fast_timeout_s if task.runner else 300
+            result = runtime.run_container_gate(
+                "tests", "fast", timeout_s=fast_timeout, log_name="tests.log"
+            )
         results = dict(state.get("gate_results", {}))
         results["tests"] = result
         return {"gate_results": results}
@@ -953,7 +1049,15 @@ def build_graph(
         results = dict(state.get("gate_results", {}))
         for result in (runtime.test_integrity(), runtime.diff_scope()):
             results[result["name"]] = result
-        results["lint"] = runtime.run_gate("lint", list(task.lint_command), log_name="lint.log")
+        if runtime.runner is not None and (task.runner is None or task.runner.full):
+            full_timeout = task.runner.full_timeout_s if task.runner else 1200
+            results["full"] = runtime.run_container_gate(
+                "full", "full", timeout_s=full_timeout, log_name="full.log"
+            )
+        else:
+            results["lint"] = runtime.run_gate(
+                "lint", list(task.lint_command), log_name="lint.log"
+            )
         verdict = "pass" if all(item["passed"] for item in results.values()) else "fail"
         return {"gate_results": results, "verdict": verdict}
 
@@ -1011,12 +1115,21 @@ def build_graph(
             "\n".join(files) + "\n", encoding="utf-8", newline="\n"
         )
         gate_results = dict(state.get("gate_results", {}))
-        for name in ("test-integrity", "diff-scope", "lint", "tests"):
+        required = ["test-integrity", "diff-scope", "tests"]
+        required.append("full" if runtime.runner is not None else "lint")
+        for name in required:
             if name not in gate_results:
                 gate_results[name] = runtime.not_run(name, "gate not executed before escalation")
         bundle = sorted(
             [path.name for path in evidence.glob("gate-*.json")]
-            + ["patch.diff", "patch.sha256", "diff-name-only.txt", "tests.log", "report.json"]
+            + [
+                "patch.diff",
+                "patch.sha256",
+                "diff-name-only.txt",
+                "tests.log",
+                "full.log",
+                "report.json",
+            ]
         )
         bundle = [name for name in bundle if (evidence / name).exists()]
         patch_report = state.get("patch_report") or {}
@@ -1174,9 +1287,17 @@ def run_graph(
     resume: bool = False,
     sleep_in_test: float = 0.0,
     recorder: TraceRecorder | None = None,
+    runner_factory: Callable[[TaskSpec, Path], ContainerTestRunner | None] | None = None,
 ) -> dict[str, Any]:
     settings.state_db.parent.mkdir(parents=True, exist_ok=True)
     recorder = recorder or TraceRecorder(settings)
+    runtime = Runtime(
+        task,
+        settings,
+        recorder,
+        sleep_in_test=sleep_in_test,
+        runner_factory=runner_factory,
+    )
     metadata = {
         "task_id": task.task_id,
         "repo": str(task.repo.resolve()),
@@ -1191,7 +1312,12 @@ def run_graph(
         saver = SqliteSaver(connection)
         saver.setup()
         app = build_graph(
-            task, settings, recorder, checkpointer=saver, sleep_in_test=sleep_in_test
+            task,
+            settings,
+            recorder,
+            checkpointer=saver,
+            sleep_in_test=sleep_in_test,
+            runtime=runtime,
         )
         snapshot = app.get_state(config) if resume else None
         if resume:
@@ -1256,6 +1382,7 @@ def run_graph(
             },
         )
     finally:
+        runtime.close()
         recorder.shutdown()
         connection.close()
 
