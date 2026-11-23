@@ -8,3 +8,6 @@ __pycache__/
 .env.*
 !.env.example
 .scratch/
+
+# Generated eval artifacts (control runs); golden digests are committed.
+eval/report-*
