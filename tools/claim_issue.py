@@ -8,8 +8,9 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
-from .select_issue import Diagnostic, eligible, gh, pinned_profile, select, unique_object, validate_profile
+from .select_issue import Diagnostic, eligible, gh, pages, pinned_profile, select, unique_object, validate_profile
 
 
 @contextmanager
@@ -17,7 +18,15 @@ def locked(state):
     import fcntl  # The writer is supported only on a local Linux host.
     fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Diagnostic('repository lock wait expired') from None
+                time.sleep(0.05)
         yield fd
     finally:
         os.close(fd)
@@ -41,13 +50,36 @@ def verify(issue_read, body, owner, known_id):
     return comment_id
 
 
+def select_for_claim(name, profile, github):
+    observed = {}
+    def remember(adapter, path):
+        observed[path] = pages(adapter, path)
+        return observed[path]
+
+    def changed(before, after):
+        if len(before) == len(after):
+            changes = [(a, b) for a, b in zip(before, after) if a != b]
+            if len(changes) == 1:
+                a, b = changes[0]
+                delta = {k for k in a.keys() | b.keys() if a.get(k) != b.get(k)}
+                path = 'repos/{}/issues/{}/comments?per_page=100'.format(profile['repo'], a['number'])
+                if (delta <= {'comments', 'updated_at'} and type(a['comments']) is int
+                        and type(b['comments']) is int and b['comments'] == a['comments'] + 1
+                        and path in observed and len(observed[path]) in (a['comments'], b['comments'])):
+                    return dict(status='check_race', number=a['number'], after=b, observed=observed[path])
+        raise Diagnostic('queue changed during selection')
+
+    return select([name], {name: profile}, github, read_comments=remember, on_change=changed)
+
+
 def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, owner, state):
+    phase = 'verification' if resume else 'prewrite'
     try:
         if (profile['repo'] != approved_repo or type(owner) is not int or owner <= 0
                 or not re.fullmatch('[0-9a-f]{32}', run_id)):
             raise Diagnostic('invalid claim approval or run identity')
         validate_profile(profile)
-        selected = None if resume else select([name], {name: profile}, github)
+        selected = None if resume else select_for_claim(name, profile, github)
         with locked(state) as directory:
             # The filename is the entire immutable write-ahead intent. No torn JSON.
             intents = {}
@@ -66,17 +98,41 @@ def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, o
             else:
                 if run_id in intents:
                     raise Diagnostic('run already has intent; use resume')
-                if selected['status'] != 'selected':
+                if selected['status'] == 'no_work':
                     return selected
                 number = selected['number']
 
             def issue_read(**kwargs):
-                issue = github(['--method', 'GET', f'repos/{approved_repo}/issues/{number}'])
+                get_issue = ['--method', 'GET', f'repos/{approved_repo}/issues/{number}']
+                issue = github(get_issue)
                 if type(issue['number']) is not int or issue['number'] != number:
                     raise Diagnostic('issue identity changed')
-                return eligible(github, approved_repo, issue, profile['trusted_user_ids'], **kwargs)
+                def stable_comments(adapter, path):
+                    rows = pages(adapter, path)
+                    ids = [row['id'] for row in rows]
+                    if (type(issue['comments']) is not int or len(ids) != issue['comments']
+                            or any(type(i) is not int or i <= 0 for i in ids) or len(set(ids)) != len(ids)
+                            or rows != pages(adapter, path) or issue != adapter(get_issue)):
+                        raise Diagnostic('incomplete or unstable comment evidence')
+                    if selected and selected['status'] == 'check_race':
+                        after = selected['after']
+                        if (any(issue.get(k) != v for k, v in after.items()) or not rows
+                                or rows[-1]['id'] != winner_id or selected['observed'] not in (rows, rows[:-1])):
+                            raise Diagnostic('unexplained change during selection')
+                    return rows
+                return eligible(github, approved_repo, issue, profile['trusted_user_ids'],
+                                read_comments=stable_comments, **kwargs)
 
-            body = f'<!-- setupai:claim v1 {approved_repo}#{number} {run_id} {owner} -->'
+            def marker(run, actor):
+                return f'<!-- setupai:claim v1 {approved_repo}#{number} {run} {actor} -->'
+
+            if selected and selected['status'] == 'check_race':
+                for run, (n, actor, winner_id) in intents.items():
+                    if n == number and winner_id is not None:
+                        verify(issue_read, marker(run, actor), actor, winner_id)
+                        return dict(status='lost_race')
+                raise Diagnostic('queue change without a confirmed competing claim')
+            body = marker(run_id, owner)
             record = state / f'{number}.{run_id}.{owner}'
             if not resume:
                 if not issue_read():
@@ -86,17 +142,23 @@ def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, o
                 with record.open('xb') as intent:
                     os.fsync(intent.fileno())
                 os.fsync(directory)
-                post(approved_repo, number, body)
+                phase = 'write_unconfirmed'
+                known_id = post(approved_repo, number, body)['id']
+                if type(known_id) is not int or known_id <= 0:
+                    raise Diagnostic('invalid comment ID in POST response')
+                record.rename(record.with_name(f'{record.name}.{known_id}'))
+                os.fsync(directory)
             comment_id = verify(issue_read, body, owner, known_id)
             if known_id is None:
                 record.rename(record.with_name(f'{record.name}.{comment_id}'))
                 os.fsync(directory)
-        return dict(status='resumed' if resume else 'claimed', repo=approved_repo, number=number,
+        return dict(status='verified_only' if resume else 'claimed', repo=approved_repo, number=number,
                     run_id=run_id, owner=owner)
     except Diagnostic as error:
-        return dict(status='diagnostic', reason=str(error))
-    except (ImportError, OSError, ValueError, AttributeError, TypeError, KeyError, subprocess.SubprocessError):
-        return dict(status='diagnostic', reason='unconfirmed state; do not retry the write')
+        return dict(status='diagnostic', phase=phase, reason=str(error))
+    except (ImportError, OSError, ValueError, AttributeError, TypeError, KeyError,
+            subprocess.SubprocessError, http.client.HTTPException):
+        return dict(status='diagnostic', phase=phase, reason='unreadable local or remote claim state')
 
 
 def command(argv):
@@ -136,14 +198,14 @@ def command(argv):
             raise Diagnostic('claim credential owner mismatch')
 
         def post(repository, number, body):
-            request('POST', f'/repos/{repository}/issues/{number}/comments', json.dumps(dict(body=body)))
+            return request('POST', f'/repos/{repository}/issues/{number}/comments', json.dumps(dict(body=body)))
 
         return run_profile(name, run, resume=bool(argv[2:]), profile=profile, github=gh, post=post,
                            approved_repo=repo, owner=owner, state=Path('/var/lib/setupAIv2/claims') / repo.lower())
     except Diagnostic as error:
-        return dict(status='diagnostic', reason=str(error))
+        return dict(status='diagnostic', phase='prewrite', reason=str(error))
     except (OSError, ValueError, TypeError, AttributeError, KeyError, http.client.HTTPException):
-        return dict(status='diagnostic', reason='unconfirmed claim configuration or remote state')
+        return dict(status='diagnostic', phase='prewrite', reason='unconfirmed claim configuration or remote state')
 
 
 if __name__ == '__main__':

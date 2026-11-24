@@ -113,7 +113,7 @@ def issue_state(row):
     return row['state']
 
 
-def eligible(github, repo, issue, trusted, *, verify_claim=None):
+def eligible(github, repo, issue, trusted, *, verify_claim=None, read_comments=pages):
     ready = 'ready-for-agent'
     if 'pull_request' in issue or issue_state(issue) != 'open':
         return False
@@ -154,7 +154,7 @@ def eligible(github, repo, issue, trusted, *, verify_claim=None):
                 raise Diagnostic('dependency is not an issue')
             if issue_state(blocker) == 'open':
                 return False
-    markers = [comment for comment in pages(github, path + '/comments?per_page=100')
+    markers = [comment for comment in read_comments(github, path + '/comments?per_page=100')
                if '<!-- setupai:claim' in comment['body'].lower()]
     return not markers if verify_claim is None else verify_claim(markers)
 
@@ -202,7 +202,7 @@ def validate_profile(profile):
         raise Diagnostic('invalid repository')
 
 
-def select(argv, profiles, github):
+def select(argv, profiles, github, *, read_comments=pages, on_change=None):
     if len(argv) != 1 or not re.fullmatch(r'[a-zA-Z0-9_-]+', argv[0]):
         raise Diagnostic('unknown profile')
     profile = pinned_profile(argv[0], github) if profiles is None else profiles[argv[0]]
@@ -216,11 +216,14 @@ def select(argv, profiles, github):
     trusted = set(profile['trusted_user_ids'])
     result = {'status': 'no_work'}
     for issue in sorted(queue, key=lambda row: row['number']):
-        if eligible(github, repo, issue, trusted):
+        if eligible(github, repo, issue, trusted, read_comments=read_comments):
             result = {'status': 'selected', 'repo': repo, 'number': issue['number'],
                       'reason': 'first eligible issue by number_ascending'}
             break
-    if queue != pages(github, queue_path):
+    after = pages(github, queue_path)
+    if queue != after:
+        if on_change is not None:
+            return on_change(queue, after)
         raise Diagnostic('queue changed during selection')
     return result
 

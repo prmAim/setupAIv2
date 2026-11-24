@@ -1,12 +1,23 @@
 # Single-host issue claim (#29)
 
-From a trusted installation run `python -I -B -m tools.claim_issue PROFILE RUN_ID`.
+Install the launcher and its sibling `tools/` from the same reviewed tree under
+an administrator-controlled directory, not the target checkout. For example:
+`python -I -B /opt/setupAIv2/claim.py PROFILE RUN_ID`. The launcher imports
+from its own resolved installation, not the working directory or `PYTHONPATH`.
 The caller retains a fresh random UUID (32 lowercase hex digits) before invoking
 the operation; no issue number is supplied. After interruption use the same
-arguments plus `--resume`. Only `claimed` and `resumed` confirm ownership.
+arguments plus `--resume`. A new claim returns `claimed`; resume returns
+`verified_only`, an observation about the run, **not permission to execute**.
 `lost_race` and `no_work` are no-ops; `diagnostic` (exit 2) requires attention.
 The claim is one comment recognized by the #28 selector, not an assignment.
 There is no model call, branch, PR, or solver checkpoint in this command.
+
+**Mandatory execution handoff:** before starting or restarting downstream work,
+the trusted supervisor must acquire exclusive execution ownership for this repo
+and issue, verify the run under that guard, and retain it through execution and
+checkpoint. The original worker must also participate. Never dispatch work based
+on `--resume` stdout alone: two verifiers can correctly observe the same claim.
+If that handoff is unavailable, stop after verification; this CLI does not supply it.
 
 ## Approval and deployment
 
@@ -32,17 +43,28 @@ not a write grant. On a trusted Linux adapter host, outside the checkout:
 
 After selection, Linux `flock` on the repository directory serializes all
 issues in that repo, deliberately sacrificing parallelism. No lockfile is
-created by a loser. Under lock, reread the issue and apply the selector's
+created by a loser. Lock acquisition times out after two seconds. Under lock,
+reread the issue and apply the selector's
 author, label provenance, assignment, dependency, linked work and marker
-checks. Only then fsync the intent and POST. A consumer that selected the
+checks. Before writing or confirming, read the full paginated comment list
+twice; require stable rows with distinct positive IDs, a count matching issue
+metadata, and unchanged issue metadata on reread. Only then fsync the intent
+and POST. A consumer that selected the
 same issue and lost the recheck writes nothing; a later scan may see no work.
-Process exit releases the kernel lock.
+Process exit releases the kernel lock. A newly posted claim between queue scans
+is a lost race only if the isolated comment-count change matches a confirmed
+journal entry and its verified remote comment. Unexplained changes are diagnostic.
 
 Intent binds issue, run and owner. Confirmation requires one exact GitHub marker
 and its numeric author, unchanged timestamps and current eligible metadata.
-First confirmation pins the comment ID by rename and directory fsync. Until
-then the proof is the unique run marker and trusted writer, not a previously
-known comment ID. Resume never posts. Missing, duplicate, edited, replaced or
+On a successful POST, pin its returned ID by rename and directory fsync **before**
+the first confirmation read. If the response or ID was lost before persistence,
+reconciliation is weaker: it can verify the unique intact marker and trusted
+writer, but cannot distinguish an identical repost by that writer before the
+first pin. Pin the recovered ID once; do not repeat the POST. Diagnostics report
+`prewrite` (no POST by this invocation), `write_unconfirmed` (reconcile, never
+blindly retry), or `verification` (resume could not verify). Resume never posts.
+Missing, duplicate, edited, replaced after pinning, or
 conflicting evidence cannot authorize a second claim. An intent with no marker
 needs human reconciliation even if the POST never reached GitHub. No timeout
 steals ownership; do not remove, split, replace or roll back the journal.

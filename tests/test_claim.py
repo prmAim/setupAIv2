@@ -3,6 +3,8 @@ import io
 import json
 import multiprocessing
 import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import time
@@ -31,9 +33,9 @@ class Remote:
         assert 'GET' in args
         path = args[-1]
         if '/issues?' in path:
-            return [[self.issue.copy()]]
+            return [[self.issue | dict(comments=len(self.log()))]]
         if path.endswith('/19'):
-            return self.issue.copy()
+            return self.issue | dict(comments=len(self.log()))
         if '/comments?' in path:
             return [[json.loads(line) for line in self.log()]]
         if '/blocked_by?' in path:
@@ -49,6 +51,7 @@ class Remote:
         comment = dict(id=42, user=USER, body=body, created_at='now', updated_at='now')
         with (self.root / 'posts').open('a') as out:
             print(json.dumps(comment), file=out)
+        return comment
 
 
 class Claim(unittest.TestCase):
@@ -77,6 +80,31 @@ class Claim(unittest.TestCase):
             self.assertEqual(command(['example', RUN])['status'], 'diagnostic')
             gh.assert_not_called()
 
+    def test_incomplete_or_changing_comment_pages_block_write_and_recovery(self):
+        original = self.remote.read
+        comment = dict(id=1, body='discussion')
+        for resume in (False, True):
+            if resume:
+                self.remote.read = original
+                self.assertEqual(self.invoke()['status'], 'claimed')
+            marker = json.loads(self.remote.log()[0]) if resume else comment
+            for first, second in (([[marker]], [[marker]]),
+                                  ([[marker], [marker]], [[marker], [marker]]),
+                                  ([[marker], [dict(id=2, body='old')]], [[marker], [dict(id=2, body='edit')]])):
+                locked = False
+                reads = iter([first, second])
+                def read(args):
+                    nonlocal locked
+                    if args[-1].endswith('/19'):
+                        locked = True
+                        return original(args) | dict(comments=2)
+                    if locked and '/comments?' in args[-1]:
+                        return next(reads)
+                    return original(args)
+                self.remote.read = read
+                self.assertEqual(self.invoke(resume=resume)['status'], 'diagnostic')
+                self.assertEqual(len(self.remote.log()), int(resume))
+
     def test_command_checks_pin_and_authenticated_writer_before_post(self):
         from tools.claim_issue import command
         pin = dict(repo=PROFILE['repo'], revision='c' * 40)
@@ -104,8 +132,7 @@ class Claim(unittest.TestCase):
                 value = USER | dict(id=owner)
             else:
                 self.assertEqual((method, path), ('POST', '/repos/owner/project/issues/19/comments'))
-                self.remote.post('owner/project', 19, json.loads(data)['body'])
-                value = {}
+                value = self.remote.post('owner/project', 19, json.loads(data)['body'])
             reply = io.BytesIO(json.dumps(value).encode())
             reply.status = 200 if method == 'GET' else 201
             conn.return_value.getresponse.return_value = reply
@@ -125,7 +152,7 @@ class Claim(unittest.TestCase):
             self.assertFalse((self.root / 'posts').exists())
             owner = 123
             self.assertEqual(command(['example', RUN])['status'], 'claimed')
-            self.assertEqual(command(['example', RUN, '--resume'])['status'], 'resumed')
+            self.assertEqual(command(['example', RUN, '--resume'])['status'], 'verified_only')
         self.assertEqual(len(self.remote.log()), 1)
 
     def test_two_processes_select_same_issue_only_winner_writes(self):
@@ -145,7 +172,7 @@ class Claim(unittest.TestCase):
                 return value
             def post(*args):
                 time.sleep(0.2)  # Widen the read/write gap across processes.
-                Remote.post(self.remote, *args)
+                return Remote.post(self.remote, *args)
             self.remote.read, self.remote.post = read, post
             output.put(self.invoke(run))
 
@@ -184,7 +211,7 @@ class Claim(unittest.TestCase):
         child.start()
         child.join(10)
         self.assertEqual(child.exitcode, 79)
-        self.assertEqual(self.invoke(resume=True), dict(status='resumed', repo='owner/project',
+        self.assertEqual(self.invoke(resume=True), dict(status='verified_only', repo='owner/project',
                                                        number=19, run_id=RUN, owner=123))
         self.assertEqual(len(self.remote.log()), 1)
 
@@ -218,7 +245,7 @@ class Claim(unittest.TestCase):
             raise TimeoutError()
         self.remote.post = uncertain
         self.assertEqual(self.invoke()['status'], 'diagnostic')
-        self.assertEqual(self.invoke(resume=True)['status'], 'resumed')
+        self.assertEqual(self.invoke(resume=True)['status'], 'verified_only')
         comment = json.loads(self.remote.log()[0])
         for rows in ([], [comment, comment], [comment | dict(user=dict(type='User', id=999))],
                      [comment | dict(id=43)],
@@ -229,3 +256,66 @@ class Claim(unittest.TestCase):
                 self.assertEqual(self.invoke(resume=True)['status'], 'diagnostic')
                 self.assertNotEqual(self.invoke('b' * 32)['status'], 'claimed')
                 self.assertEqual(len(self.remote.log()), 1)
+
+    def test_successful_post_id_survives_replacement_before_first_readback(self):
+        def post(*args):
+            observed = Remote.post(self.remote, *args)
+            return observed | dict(id=41)  # GET now sees replacement 42.
+        self.remote.post = post
+        self.assertEqual(self.invoke()['phase'], 'write_unconfirmed')
+        self.assertEqual(self.invoke(resume=True)['status'], 'diagnostic')
+        self.assertEqual(len(self.remote.log()), 1)
+
+    def test_concurrent_resume_is_verification_not_execution_permission(self):
+        self.assertEqual(self.invoke()['status'], 'claimed')
+        ctx = multiprocessing.get_context('fork')
+        barrier, output = ctx.Barrier(2, timeout=5), ctx.SimpleQueue()
+        def worker():
+            barrier.wait()
+            output.put(self.invoke(resume=True)['status'])
+        children = [ctx.Process(target=worker) for _ in range(2)]
+        for child in children:
+            child.start()
+        for child in children:
+            child.join(10)
+            self.assertEqual(child.exitcode, 0)
+        self.assertEqual([output.get(), output.get()], ['verified_only'] * 2)
+        self.assertEqual(len(self.remote.log()), 1)
+
+    def test_comment_posted_between_queue_scans(self):
+        original = self.remote.read
+        for race in (False, True):
+            scans = 0
+            def read(args):
+                nonlocal scans
+                if '/issues?' in args[-1]:
+                    scans += 1
+                    if scans == 2:
+                        if race:
+                            self.remote.read = original
+                            self.assertEqual(self.invoke('b' * 32)['status'], 'claimed')
+                        else:
+                            self.remote.post('owner/project', 19, 'discussion')
+                return original(args)
+            self.remote.read = read
+            self.assertEqual(self.invoke()['status'], 'lost_race' if race else 'diagnostic')
+            self.assertEqual(len(self.remote.log()), 1)
+            self.assertEqual(len(list(self.state.iterdir())), int(race))
+            (self.root / 'posts').unlink()
+
+    def test_lock_deadline_is_prewrite(self):
+        import fcntl
+        fd = os.open(self.state, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual(self.invoke(), dict(status='diagnostic', phase='prewrite', reason='repository lock wait expired'))
+        self.assertEqual(self.remote.log(), [])
+
+    def test_isolated_launcher_from_untrusted_cwd(self):
+        launcher = Path(__file__).resolve().parents[1] / 'claim.py'
+        (self.root / 'tools.py').write_text('raise AssertionError()')
+        p = subprocess.run([sys.executable, '-I', '-B', str(launcher), 'bad/name', RUN], cwd=self.root,
+                           env={'PYTHONPATH': str(self.root)}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(json.loads(p.stdout), dict(status='diagnostic', phase='prewrite',
+                         reason='expected PROFILE RUN_ID [--resume] on Linux'))
