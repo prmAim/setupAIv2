@@ -24,10 +24,11 @@ At that revision `.agent/selection.json` is the separately approved selection
 policy, not a general solver profile. Example shape only, not an approval:
 
 ```json
-{"version":1,"repo":"example/project","base":"main","order":"number_ascending","trusted_users":["maintainer"],"required_skills":[],"required_mcp":[]}
+{"version":2,"repo":"example/project","base":"main","order":"number_ascending","trusted_user_ids":[123],"required_skills":[],"required_mcp":[]}
 ```
 
-Version 1 supports ascending issue number only. No skill or MCP verifier is
+Version 2 trusts numeric GitHub user account IDs, never logins. Version 1
+is rejected rather than auto-migrated. Only ascending issue number is supported. No skill or MCP verifier is
 registered: any nonempty requirement stops the run. Never remove requirements
 to get a selection. Issue text and comments cannot configure capabilities or
 supply commands. No profile or pin is installed by this change.
@@ -36,15 +37,20 @@ supply commands. No profile or pin is installed by this change.
 
 It reads GitHub's open ready queue, follows REST pagination with `gh api
 --paginate --slurp`, and checks the current label against its most recent
-application. Native blocker counts must agree with the dependency list. The
+application by matching the current REST label node ID against the paginated
+GraphQL timeline, not a historical label name. Native blocker counts must agree with the dependency list. The
 documented `Blocked by: #1, #2` fallback is restricted to the same repository.
 An assignee, `claimed`/`in-progress` label, `<!-- setupai:claim` comment,
-linked branch, or open closing PR excludes an issue. A marker only excludes;
+linked branch, open closing PR, or visible timeline reference from any open PR
+(including a non-closing `Refs #19`) excludes an issue. A marker only excludes;
 it cannot grant rights. Remove stale markers through the normal human process.
 
 Unpublished worktrees, unlinked branches/PRs, private work invisible to the
 credential, and informal conversations are not proof the tracker can supply.
-Multiple reads are not atomic. A later claimant must recheck; #28 never claims.
+The full queue is read twice, once before evaluating candidates and once before
+returning. Any observed difference is diagnostic, without retries. Two identical
+observations are not an atomic snapshot: changes that reverse between reads
+can be missed. A later claimant must recheck; #28 never claims.
 
 ## Acceptance record
 
@@ -67,3 +73,32 @@ label removal/reapplication, assignee, blocker, claim, linked branch and open
 PR. The empty fixture records every outbound request. The pinned-profile
 fixture also checks the real adapter command line. No live orbita selection
 was attempted without an approved pin.
+
+### Review follow-up
+
+| Container red | Green |
+| --- | --- |
+| Empty first scan returned `no_work` after membership changed | Second full scan detects the change; exact pin path and GET sequence verified |
+| ID-only mixed queue returned diagnostic | Numeric author/actor IDs, current label node ID and paginated timeline select #9 twice |
+| Open non-closing PR on page two selected; null/unknown PR sources selected | Open reference excludes; closed PR and issue references do not; unreadable source is diagnostic |
+| HTTP 403 returned generic error | Diagnostic preserves operation and status but omits raw stderr |
+
+The authenticated, read-only `tools/issue_timeline.graphql` query ran against
+`prmAim/setupAIv2#28`. The label ID matched the REST issue label node ID; the
+query returned the user database ID and a cross-reference with source type
+`Issue`. The open non-closing PR case is fixture evidence, not a live orbita run.
+
+Standalone subprocess test (Linux, repository root; no credentials):
+
+```sh
+f="$PWD/tests/fixtures/selection"
+docker run --rm --network none --read-only --cap-drop ALL --tmpfs /tmp \
+  -v "$PWD:/work:ro" -v "$f/gh:/usr/bin/gh:ro" \
+  -v "$f/index.json:/etc/setupAIv2/selection-profiles.json:ro" \
+  --entrypoint python3 setupaiv2-selection-test:28 -I -B /work/tests/fixtures/selection/check_no_work.py
+```
+
+Observed: `no_work`, exactly one pinned-profile GET and two paginated queue
+GETs. The writable target/HOME (including a decoy index) was unchanged. Only
+the fixture transport wrote its out-of-target audit log. No orbita profile was
+created, installed or selected. Scope ends at the selection result.

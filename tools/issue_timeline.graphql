@@ -1,0 +1,18 @@
+query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+      linkedBranches(first: 1) { totalCount }
+      closedByPullRequestsReferences(first: 1, includeClosedPrs: false) { totalCount }
+      timelineItems(first: 100, after: $endCursor, itemTypes: [LABELED_EVENT, UNLABELED_EVENT, CROSS_REFERENCED_EVENT]) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          __typename
+          ... on LabeledEvent { id label { id } actor { __typename ... on User { databaseId } } }
+          ... on UnlabeledEvent { id label { id } }
+          ... on CrossReferencedEvent { id source { __typename ... on PullRequest { state } } }
+        }
+      }
+    }
+  }
+}
