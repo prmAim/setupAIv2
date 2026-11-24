@@ -258,13 +258,6 @@ class SandboxIsolationTests(EvalHarnessFixture):
         self.assertEqual(harness.git(dest, "remote", "-v"), "")
 
 
-QUOTA_STUB = (
-    "@echo off\r\n"
-    "echo ERROR: usage limit reached. Please try again at 2026-11-23T18:04:00Z >&2\r\n"
-    "exit /b 1\r\n"
-)
-
-
 class HiddenRunnerTests(unittest.TestCase):
     def test_both_languages_use_runner_and_never_retry_on_host(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -313,8 +306,9 @@ class ControlMatrixTests(EvalHarnessFixture):
             )
             for mode in ("gold", "noop", "cheat")
         }
-        stub = Path(cls._temp.name) / "codex-quota.cmd"
-        stub.write_text(QUOTA_STUB, encoding="utf-8")
+        stub = Path(cls._temp.name) / "solver-canary.cmd"
+        cls.marker = stub.with_suffix(".started")
+        stub.write_text(f'@echo started > "{cls.marker}"\n', encoding="utf-8")
         codex_paths = dataclasses.replace(
             cls.paths,
             codex=harness.CodexOptions(
@@ -367,20 +361,21 @@ class ControlMatrixTests(EvalHarnessFixture):
         self.assertIn("test-file-modified", rules)
         self.assertEqual(case["hidden_tests"]["tests_patch_exit"], 0)
 
-    def test_codex_quota_is_not_run_not_fail(self) -> None:
+    def test_preflight_denies_before_solver_or_grader(self) -> None:
         case = self.cases["codex"]
         self.assertEqual(case["verdict"], "not_run")
-        self.assertEqual(case["reason"], "engine:quota_exhausted")
+        self.assertEqual(case["reason"], "solver_isolation_unverified")
         self.assertTrue(case["not_run"])
         self.assertTrue(case["incomplete"])
         self.assertFalse(case["resolved"])
         self.assertIsNone(case["harness_error"])
-        self.assertTrue(case["engine"]["infrastructure"])
-        self.assertEqual(case["engine"]["reset_at_utc"], "2026-11-23T18:04:00Z")
-        self.assertIn("hidden-skipped", case["order"])
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(case["order"], ["solver-preflight"])
+        self.assertEqual((case["engine_calls"], case["iterations"]), (0, 0))
+        self.assertEqual(harness.exit_code_for([case], []), harness.EXIT_INCOMPLETE)
         self.assertIsNone(case["hidden_tests"]["exit_code"])
 
-    def test_codex_quota_does_not_enter_the_failure_count(self) -> None:
+    def test_blocked_solver_does_not_enter_the_failure_count(self) -> None:
         cases = list(self.cases.values())
         counts = harness.summarize_cases(cases)
         self.assertEqual(counts["resolved"], 1)
@@ -432,8 +427,11 @@ class ControlMatrixTests(EvalHarnessFixture):
         self.assertTrue(payload["incomplete"])
         self.assertEqual(payload["counts"]["not_run"], 1)
         markdown = Path(written["markdown"]).read_text(encoding="utf-8")
-        self.assertIn("not_run because quota_exhausted", markdown)
-        self.assertIn("2026-11-23T18:04:00Z", markdown)
+        self.assertIn("solver_isolation_unverified", markdown)
+
+    def test_direct_eval_adapter_is_also_disabled(self) -> None:
+        with self.assertRaisesRegex(harness.HarnessError, "solver_isolation_unverified"):
+            harness.CodexEvalEngine().apply(Path(self._temp.name))
 
 
 class ExitCodeTests(unittest.TestCase):

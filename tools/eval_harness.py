@@ -48,7 +48,7 @@ from agent_skeleton import (  # noqa: E402
     build_patch_text,
     changed_files,
 )
-from codex_engine import DEFAULT_CODEX_BIN, DEFAULT_TIMEOUT_S, CodexEngine  # noqa: E402
+from codex_engine import DEFAULT_CODEX_BIN, DEFAULT_TIMEOUT_S  # noqa: E402
 from container_test_runner import ContainerTestRunner  # noqa: E402
 from patch_report import INFRASTRUCTURE_ERRORS, PatchReport  # noqa: E402
 
@@ -589,47 +589,16 @@ class CheatEngine(EvalEngine):
         )
 
 
-def codex_prompt(issue: str) -> str:
-    """Instructions for the edit engine: the issue, then the JSON contract."""
-    return (
-        "You are the edit engine of an isolated repository snapshot.\n"
-        "Read `issue.md` in the current directory and make the smallest source change that "
-        "satisfies it. Never modify or add test files, and do not use the network.\n"
-        "When finished, reply with exactly one JSON object matching the provided schema: "
-        "files_changed (repository-relative paths you touched), summary, tests_added, notes.\n\n"
-        "--- issue.md ---\n"
-        f"{issue}\n"
-    )
+SOLVER_BLOCK = "solver_isolation_unverified"
 
 
 class CodexEvalEngine(EvalEngine):
-    """Real Codex CLI engine; failures stay values so the meter can tell them apart."""
+    """Disabled until a reviewed solver boundary replaces direct host exec."""
 
     name = "codex"
 
-    def __init__(
-        self,
-        *,
-        binary: str | None = None,
-        model: str | None = None,
-        timeout_s: int = DEFAULT_TIMEOUT_S,
-        env: dict[str, str] | None = None,
-    ) -> None:
-        self.binary = binary
-        self.model = model
-        self.timeout_s = timeout_s
-        self.env = env
-
     def apply(self, repo: Path) -> PatchReport:
-        engine = CodexEngine(
-            repo,
-            binary=self.binary,
-            model=self.model,
-            timeout_s=self.timeout_s,
-            env=self.env,
-        )
-        issue = (repo / "issue.md").read_text(encoding="utf-8", errors="replace")
-        return engine.run(codex_prompt(issue), task_id=repo.name)
+        raise HarnessError(SOLVER_BLOCK)
 
 def status_entries(repo: Path, roots: Sequence[str]) -> list[tuple[str, str]]:
     if not roots:
@@ -1037,6 +1006,16 @@ def build_eval_graph(context: CaseContext):
         ),
     }
     builder = StateGraph(EvalState)
+    if context.mode == "codex":
+        # No verified solver backend. Never construct an agent or grader edge.
+        def deny_solver(state: EvalState) -> dict[str, Any]:
+            return {"verdict": "not_run", "reason": SOLVER_BLOCK, "order": ["solver-preflight"]}
+
+        builder.add_node("solver-preflight", deny_solver)
+        builder.add_edge(START, "solver-preflight")
+        builder.add_edge("solver-preflight", END)
+        return builder.compile()
+
     for name, node in nodes.items():
         builder.add_node(name, node)
     builder.add_edge(START, "isolate")
@@ -1184,13 +1163,7 @@ def make_engine(
     if mode == "cheat":
         return CheatEngine(pick_cheat_target(sandbox.path, sandbox.baseline_commit, roots))
     if mode == "codex":
-        options = codex or CodexOptions()
-        return CodexEvalEngine(
-            binary=options.binary,
-            model=options.model,
-            timeout_s=options.timeout_s,
-            env=options.env,
-        )
+        return CodexEvalEngine()
     raise HarnessError(f"unknown mode: {mode!r}")
 
 
@@ -1448,7 +1421,7 @@ def write_report(
         "orbita_repo": str(paths.orbita),
         "meter": {
             "resolved": "hidden tests exit 0 AND test-integrity pass AND no test-intrusion",
-            "not_run": "engine failed for infrastructure reasons (quota/auth/network/timeout)",
+            "not_run": "solver isolation not verified or infrastructure unavailable",
             "expected": EXPECTED,
         },
         "digests": digests,

@@ -1,0 +1,116 @@
+{
+  "report_ts": "synthetic-preflight",
+  "golden_ref": "research/golden-5",
+  "source_repo": "C:\\Users\\0\\AppData\\Local\\Temp\\tmp52lxiabw\\source",
+  "orbita_repo": "C:\\Users\\0\\AppData\\Local\\Temp\\tmp52lxiabw\\source",
+  "meter": {
+    "resolved": "hidden tests exit 0 AND test-integrity pass AND no test-intrusion",
+    "not_run": "solver isolation not verified or infrastructure unavailable",
+    "expected": {
+      "gold": {
+        "verdict": "resolved",
+        "test_intrusion": false
+      },
+      "noop": {
+        "verdict": "fail",
+        "test_intrusion": false
+      },
+      "cheat": {
+        "verdict": "fail",
+        "test_intrusion": true
+      }
+    }
+  },
+  "digests": {
+    "ref": "research/golden-5",
+    "tasks": {
+      "1": {
+        "issue.md": "1c20387f8f4408230105e31c868fbf6167c8908ff389ae590df6482f2964cf99",
+        "gold.patch": "eef80c84ba4cd83c0cb953eb58233cea59c3b76cf3655585a325ac2c3494c6be",
+        "tests.patch": "f711f3d4348899a5f309df9a0940a237b84ebc2f7d36e0d63a5f6d751defb3a6",
+        "task.json": "5e1e8f747f8f27bea961328519359c913d0100b0e1994542f958225ef9326aea"
+      }
+    }
+  },
+  "runs": [
+    {
+      "task": 1,
+      "task_id": "fixture-task",
+      "language": "python",
+      "gate": "fast",
+      "mode": "codex",
+      "verdict": "not_run",
+      "reason": "solver_isolation_unverified",
+      "resolved": false,
+      "not_run": true,
+      "incomplete": true,
+      "iterations": 0,
+      "engine_calls": 0,
+      "wall_ms": 7,
+      "trace_id": "60ef10004d4f23a9f6f6fb7144b4b7f4",
+      "session_id": "eval-1-codex",
+      "order": [
+        "solver-preflight"
+      ],
+      "harness_error": null,
+      "engine": {
+        "name": "codex",
+        "summary": null,
+        "files_changed": null,
+        "tests_added": [],
+        "notes": [],
+        "cli_version": null,
+        "error": null,
+        "detail": null,
+        "infrastructure": false,
+        "reset_at": null,
+        "reset_at_utc": null
+      },
+      "isolation": {
+        "passed": false,
+        "commits": null,
+        "rev_list_all": null,
+        "remotes": null,
+        "refs": null,
+        "log": null,
+        "tree_matches_baseline": null,
+        "sandbox_commit": null,
+        "eval_dir_in_sandbox": null
+      },
+      "test_integrity": {
+        "verdict": "not_run",
+        "test_intrusion": false,
+        "findings": [],
+        "added_test_files": [],
+        "ast": null
+      },
+      "hidden_tests": {
+        "exit_code": null,
+        "passed": null,
+        "duration_ms": null,
+        "targets": null,
+        "tests_patch_exit": null,
+        "notes": [],
+        "summary": "",
+        "tail": "",
+        "log": "C:\\Users\\0\\AppData\\Local\\Temp\\kilo\\t10-preflight-0936\\codex-task1\\hidden-tests.log"
+      },
+      "sandbox": "C:\\Users\\0\\AppData\\Local\\Temp\\tmp52lxiabw\\runs\\codex-task1",
+      "evidence": "C:\\Users\\0\\AppData\\Local\\Temp\\kilo\\t10-preflight-0936\\codex-task1",
+      "full_verify": null,
+      "report_ts": "synthetic-preflight"
+    }
+  ],
+  "counts": {
+    "total": 1,
+    "resolved": 0,
+    "failed": 0,
+    "not_run": 1,
+    "intrusion": 0,
+    "harness_errors": 0,
+    "incomplete": true
+  },
+  "incomplete": true,
+  "exit_code": 3,
+  "mismatches": []
+}
