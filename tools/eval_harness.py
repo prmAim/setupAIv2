@@ -58,7 +58,6 @@ DEFAULT_SOURCE = Path(r"C:\Git\setupAIv2")
 DEFAULT_ORBITA = Path(r"C:\Git\orbita")
 DEFAULT_WORK_ROOT = Path(r"C:\Git\_wf\t24-runs")
 DEFAULT_EVIDENCE_ROOT = Path(r"C:\Git\_wf\t24-evidence")
-DEFAULT_JAVA_HOME = Path(r"C:\Program Files\Java\jdk-25")
 
 MODES = ("gold", "noop", "cheat", "codex")
 EXPECTED = {
@@ -171,13 +170,6 @@ def _decode(payload: Any) -> str:
     if isinstance(payload, bytes):
         return payload.decode("utf-8", errors="replace")
     return str(payload)
-
-def shell_command(exe: Path, args: Sequence[str]) -> list[str]:
-    """Batch wrappers (``mvnw.cmd``) need cmd.exe; plain binaries do not."""
-    if exe.suffix.lower() in {".cmd", ".bat"}:
-        return ["cmd", "/c", str(exe), *args]
-    return [str(exe), *args]
-
 
 def git(repo: Path, *args: str, timeout_s: int = 300) -> str:
     outcome = run_command(
@@ -750,69 +742,40 @@ def run_hidden_tests(
     *,
     repo: Path,
     plan: dict[str, Any],
-    python_exe: str,
-    java_home: Path | None,
+    run_id: str,
+    evidence: Path,
     timeout_s: int,
+    runner_factory: Callable[..., ContainerTestRunner] | None = None,
 ) -> dict[str, Any]:
-    commands: list[dict[str, Any]] = []
-    duration_ms = 0
-    exit_code = 0
-    if plan["python_patterns"]:
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        for pattern in plan["python_patterns"]:
-            outcome = run_command(
-                [python_exe, "-m", "unittest", "discover", "-s", "tests", "-p", pattern, "-v"],
-                cwd=repo,
-                timeout_s=timeout_s,
-                env=env,
-            )
-            commands.append(
-                {
-                    "command": outcome.command,
-                    "exit_code": outcome.exit_code,
-                    "duration_ms": outcome.duration_ms,
-                    "timed_out": outcome.timed_out,
-                    "output": outcome.combined,
-                }
-            )
-            duration_ms += outcome.duration_ms
-            exit_code = exit_code or outcome.exit_code
+    targets = [
+        ["/work/.venv/bin/python", "-m", "unittest", "discover", "-s", "tests", "-p", pattern, "-v"]
+        for pattern in plan["python_patterns"]
+    ]
     if plan["java_classes"]:
-        backend = repo / "backend"
-        wrapper = backend / ("mvnw.cmd" if os.name == "nt" else "mvnw")
-        if not wrapper.is_file():
-            commands.append(
-                {
-                    "command": [str(wrapper)],
-                    "exit_code": 127,
-                    "duration_ms": 0,
-                    "timed_out": False,
-                    "output": f"maven wrapper is missing: {wrapper}",
-                }
-            )
-            exit_code = exit_code or 127
-        else:
-            env = dict(os.environ)
-            if java_home and (Path(java_home) / "bin").is_dir():
-                env["JAVA_HOME"] = str(java_home)
-            selector = ",".join(plan["java_classes"])
-            outcome = run_command(
-                shell_command(wrapper, ["-B", "-ntp", "-o", f"-Dtest={selector}", "test"]),
-                cwd=backend,
-                timeout_s=timeout_s,
-                env=env,
-            )
-            commands.append(
-                {
-                    "command": outcome.command,
-                    "exit_code": outcome.exit_code,
-                    "duration_ms": outcome.duration_ms,
-                    "timed_out": outcome.timed_out,
-                    "output": outcome.combined,
-                }
-            )
-            duration_ms += outcome.duration_ms
-            exit_code = exit_code or outcome.exit_code
+        selector = ",".join(plan["java_classes"])
+        targets.append([
+            "bash", "-c", 'cd /work/backend && exec bash ./mvnw "$@"', "mvnw",
+            "-B", "-ntp", "-o", f"-Dtest={selector}", "test",
+        ])
+    runner = (runner_factory or ContainerTestRunner)(run_id=run_id, repo_path=repo)
+    commands = []
+    duration_ms = exit_code = 0
+    try:
+        for index, argv in enumerate(targets, start=1):
+            log = evidence / f"hidden-{index}.log"
+            result = runner.exec(argv, timeout_s=timeout_s, log_path=log)
+            commands.append({
+                **dataclasses.asdict(result),
+                "timed_out": result.verdict == "timeout",
+                "output": log.read_text(encoding="utf-8", errors="replace")
+                if log.is_file() else result.reason or result.output_tail,
+            })
+            duration_ms += result.duration_ms
+            exit_code = exit_code or result.exit_code
+            if result.verdict in {"not_run", "timeout"}:
+                break
+    finally:
+        runner.stop(cleanup=True)
     return {
         "exit_code": exit_code,
         "passed": exit_code == 0,
@@ -880,8 +843,6 @@ class CaseContext:
     sandbox: Sandbox
     engine: EvalEngine
     evidence: Path
-    python_exe: str
-    java_home: Path | None
     hidden_timeout_s: int
     recorder: TraceRecorder
     full_verify: bool = False
@@ -1007,8 +968,9 @@ def build_eval_graph(context: CaseContext):
         result = run_hidden_tests(
             repo=context.sandbox.path,
             plan=plan,
-            python_exe=context.python_exe,
-            java_home=context.java_home,
+            run_id=f"hidden-{context.task.number}-{context.mode}",
+            evidence=evidence,
+            runner_factory=context.runner_factory,
             timeout_s=context.hidden_timeout_s,
         )
         output = "\n\n".join(
@@ -1041,6 +1003,8 @@ def build_eval_graph(context: CaseContext):
         if not apply_outcome["passed"] and not state.get("verdict"):
             update["verdict"] = "fail"
             update["reason"] = "hidden:tests_patch_apply"
+        elif any(c["verdict"] == "not_run" for c in result["commands"]) and not state.get("verdict"):
+            update.update(verdict="not_run", reason="hidden:runner_unavailable")
         elif not result["passed"] and not state.get("verdict"):
             update["verdict"] = "fail"
             update["reason"] = "hidden-tests"
@@ -1238,8 +1202,6 @@ class HarnessPaths:
     work_root: Path = DEFAULT_WORK_ROOT
     evidence_root: Path = DEFAULT_EVIDENCE_ROOT
     report_root: Path = ROOT / "eval"
-    python: str = dataclasses.field(default_factory=lambda: sys.executable)
-    java_home: Path | None = DEFAULT_JAVA_HOME
     hidden_timeout_s: int = 1800
     full_timeout_s: int = 1800
     codex: CodexOptions = dataclasses.field(default_factory=CodexOptions)
@@ -1277,8 +1239,6 @@ def run_control(
         sandbox=sandbox,
         engine=engine,
         evidence=evidence,
-        python_exe=paths.python,
-        java_home=paths.java_home,
         hidden_timeout_s=paths.hidden_timeout_s,
         recorder=_recorder(evidence),
         full_verify=full_verify,
@@ -1541,8 +1501,6 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--work-root", type=Path, default=DEFAULT_WORK_ROOT)
     run.add_argument("--evidence-root", type=Path, default=DEFAULT_EVIDENCE_ROOT)
     run.add_argument("--report-root", type=Path, default=ROOT / "eval")
-    run.add_argument("--python", default=sys.executable)
-    run.add_argument("--java-home", type=Path, default=DEFAULT_JAVA_HOME)
     run.add_argument("--hidden-timeout", type=int, default=1800)
     run.add_argument("--full-verify", default="", help="task number that also runs the full gate")
     run.add_argument("--full-timeout", type=int, default=1800)
@@ -1587,8 +1545,6 @@ def main(argv: list[str] | None = None) -> int:
         work_root=args.work_root,
         evidence_root=args.evidence_root,
         report_root=args.report_root,
-        python=args.python,
-        java_home=args.java_home,
         hidden_timeout_s=args.hidden_timeout,
         full_timeout_s=args.full_timeout,
         codex=CodexOptions(

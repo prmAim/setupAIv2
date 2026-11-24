@@ -638,7 +638,7 @@ class ContainerTestRunner:
         return self.exec(self.command_for(profile), timeout_s, log_path=log_path)
 
     def stop(self, cleanup: bool = True) -> None:
-        if cleanup:
+        if cleanup and self.state != "unavailable":
             if self.runner_id:
                 self.docker.remove(self.runner_id)
             if self.dind_id:

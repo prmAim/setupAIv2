@@ -14,12 +14,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 import eval_harness as harness
+from container_test_runner import ExecResult
 
 GREETER = 'def greet(name: str) -> str:\n    return f"hi {name}"\n'
 SHOUT = 'def shout(name: str) -> str:\n    return f"HI {name.upper()}"\n'
@@ -153,8 +155,6 @@ def build_fixture(root: Path, *, tamper: bool = False) -> dict[str, Path | str]:
             work_root=root / "runs",
             evidence_root=root / "evidence",
             report_root=root / "reports",
-            python=sys.executable,
-            java_home=None,
         ),
     }
 
@@ -265,17 +265,51 @@ QUOTA_STUB = (
 )
 
 
+class HiddenRunnerTests(unittest.TestCase):
+    def test_both_languages_use_runner_and_never_retry_on_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = Mock()
+            def execute(argv, timeout_s, log_path):
+                verdict = "pass" if argv[0].endswith("python") else "not_run"
+                return ExecResult(argv, int(verdict != "pass"), 5, str(log_path), verdict,
+                                  reason="unavailable" if verdict == "not_run" else "")
+
+            runner.exec.side_effect = execute
+            with patch.object(harness, "run_command", side_effect=AssertionError("host execution")):
+                result = harness.run_hidden_tests(
+                    repo=root, evidence=root, run_id="mixed", timeout_s=17,
+                    plan=dict(python_patterns=["test_one.py"], java_classes=["OneTest"], notes=[]),
+                    runner_factory=Mock(return_value=runner),
+                )
+            py, java = result["commands"]
+            self.assertIn("test_one.py", py["command"])
+            self.assertIn("-Dtest=OneTest", java["command"])
+            self.assertEqual(java["output"], "unavailable")
+            self.assertFalse(result["passed"])
+            runner.stop.assert_called_once_with(cleanup=True)
+
+
 class ControlMatrixTests(EvalHarnessFixture):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
         task = cls.golden.tasks[0]
+        def fake_runner(run_id, repo_path):
+            runner = Mock()
+            def execute(argv, timeout_s, log_path):
+                fixed = (repo_path / "tools/shout.py").exists()
+                return ExecResult(argv, int(not fixed), 1, str(log_path), "pass" if fixed else "fail")
+            runner.exec.side_effect = execute
+            return runner
+
         cls.cases = {
             mode: harness.run_control(
                 task=task,
                 mode=mode,
                 paths=cls.paths,
                 report_ts="unit",
+                runner_factory=fake_runner,
             )
             for mode in ("gold", "noop", "cheat")
         }
