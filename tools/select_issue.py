@@ -113,7 +113,7 @@ def issue_state(row):
     return row['state']
 
 
-def eligible(github, repo, issue, trusted):
+def eligible(github, repo, issue, trusted, *, verify_claim=None):
     ready = 'ready-for-agent'
     if 'pull_request' in issue or issue_state(issue) != 'open':
         return False
@@ -154,14 +154,12 @@ def eligible(github, repo, issue, trusted):
                 raise Diagnostic('dependency is not an issue')
             if issue_state(blocker) == 'open':
                 return False
-    for comment in pages(github, path + '/comments?per_page=100'):
-        if '<!-- setupai:claim' in comment['body'].lower():
-            return False
-
-    return True
+    markers = [comment for comment in pages(github, path + '/comments?per_page=100')
+               if '<!-- setupai:claim' in comment['body'].lower()]
+    return not markers if verify_claim is None else verify_claim(markers)
 
 
-def pinned_profile(name, github):
+def pinned_profile(name, github, *, required_pin=None):
     location = Path('C:/Program Files/setupAIv2') if os.name == 'nt' else Path('/etc/setupAIv2')
     try:
         index = json.loads((location / 'selection-profiles.json').read_text(encoding='utf-8'),
@@ -171,6 +169,8 @@ def pinned_profile(name, github):
     if name not in index:
         raise Diagnostic('unknown profile')
     pin = index[name]
+    if required_pin is not None and pin != required_pin:
+        raise Diagnostic('claim approval does not match selection pin')
     if (set(pin) != {'repo', 'revision'} or not REPOSITORY.fullmatch(pin['repo'])
             or not re.fullmatch(r'[0-9a-f]{40}', pin['revision'])):
         raise Diagnostic('invalid profile pin')
@@ -185,10 +185,7 @@ def pinned_profile(name, github):
     return profile
 
 
-def select(argv, profiles, github):
-    if len(argv) != 1 or not re.fullmatch(r'[a-zA-Z0-9_-]+', argv[0]):
-        raise Diagnostic('unknown profile')
-    profile = pinned_profile(argv[0], github) if profiles is None else profiles[argv[0]]
+def validate_profile(profile):
     fields = {'repo', 'base', 'version', 'order', 'trusted_user_ids', 'required_skills', 'required_mcp'}
     if (set(profile) != fields or type(profile['version']) is not int or profile['version'] != 2
             or profile['order'] != 'number_ascending'
@@ -203,12 +200,20 @@ def select(argv, profiles, github):
     repo = profile['repo']
     if not REPOSITORY.fullmatch(repo):
         raise Diagnostic('invalid repository')
+
+
+def select(argv, profiles, github):
+    if len(argv) != 1 or not re.fullmatch(r'[a-zA-Z0-9_-]+', argv[0]):
+        raise Diagnostic('unknown profile')
+    profile = pinned_profile(argv[0], github) if profiles is None else profiles[argv[0]]
+    validate_profile(profile)
+    repo = profile['repo']
     queue_path = f'repos/{repo}/issues?state=open&labels=ready-for-agent&per_page=100'
     queue = pages(github, queue_path)
     numbers = [row['number'] for row in queue]
     if any(type(n) is not int or n < 1 for n in numbers) or len(set(numbers)) != len(numbers):
         raise Diagnostic('invalid or unstable issue list')
-    trusted = set(users)
+    trusted = set(profile['trusted_user_ids'])
     result = {'status': 'no_work'}
     for issue in sorted(queue, key=lambda row: row['number']):
         if eligible(github, repo, issue, trusted):
