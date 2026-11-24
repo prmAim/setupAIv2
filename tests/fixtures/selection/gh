@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Only mounted as /usr/bin/gh in the isolated subprocess acceptance test."""
+import base64
+import json
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+with Path('/tmp/selection-requests').open('a') as audit:
+    print(json.dumps(args), file=audit)
+prefix = ['api', '--hostname', 'github.com', '--method', 'GET']
+if args == prefix + ['repos/owner/project/contents/.agent/selection.json?ref=' + 'a' * 40]:
+    profile = {'repo': 'owner/project', 'base': 'main', 'version': 2, 'order': 'number_ascending',
+               'trusted_user_ids': [123], 'required_mcp': [], 'required_skills': []}
+    print(json.dumps({'type': 'file', 'encoding': 'base64',
+                      'content': base64.b64encode(json.dumps(profile).encode()).decode()}))
+elif args == prefix + ['--paginate', '--slurp', 'repos/owner/project/issues?state=open&labels=ready-for-agent&per_page=100']:
+    print('[[]]')
+else:
+    sys.exit(1)
