@@ -14,7 +14,12 @@ from pathlib import Path
 
 FILE_LIMIT = 16384
 TOTAL_LIMIT = 65536
+WIRE_LIMIT = 131072  # Whole JSON message in either direction, including escapes and metadata.
 OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+class UnapprovedPath(ValueError):
+    """A replacement targeted a string path outside the reviewed inventory."""
 
 
 def require(condition, reason):
@@ -89,8 +94,10 @@ class Bundle:
     files: tuple[tuple[str, bytes], ...]
 
     def request(self):
-        return wire({"issue": self.issue, "files": [
+        data = wire({"issue": self.issue, "files": [
             {"path": p, "sha256": digest(b), "text": b.decode()} for p, b in self.files]})
+        require(len(data) <= WIRE_LIMIT, "serialized request exceeds budget")
+        return data
 
 
 def build(repo, tree, approved, issue):
@@ -127,7 +134,7 @@ def unique(pairs):
 
 
 def replacements(bundle, response):
-    require(type(response) is bytes and len(response) <= 2 * TOTAL_LIMIT, "invalid response size")
+    require(type(response) is bytes and len(response) <= WIRE_LIMIT, "invalid response size")
     obj = json.loads(response.decode(), object_pairs_hook=unique)
     require(type(obj) is dict and obj.keys() == {"request", "edits"}
             and obj["request"] == digest(bundle.request()), "wrong envelope or request")
@@ -138,7 +145,10 @@ def replacements(bundle, response):
     for edit in edits:
         require(type(edit) is dict and edit.keys() == {"path", "sha256", "text"}, "bad edit fields")
         path = edit["path"]
-        require(type(path) is str and path in result and path not in seen, "unapproved or repeated path")
+        require(type(path) is str, "expected path string")
+        if path not in result:
+            raise UnapprovedPath(path)
+        require(path not in seen, "repeated path")
         require(edit["sha256"] == digest(result[path]), "stale baseline")
         result[path] = text_bytes(edit["text"], FILE_LIMIT)
         seen.add(path)
