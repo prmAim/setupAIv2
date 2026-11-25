@@ -115,8 +115,12 @@ class Draft:
             with closing(sqlite3.connect(self.journal)) as db, db:
                 db.execute('CREATE TABLE IF NOT EXISTS proof (run TEXT PRIMARY KEY, binding TEXT, digest TEXT, head TEXT, evidence TEXT)')
                 proof = db.execute('SELECT binding,digest,head,evidence FROM proof WHERE run=?', (claim['run_id'],)).fetchone()
-            if proof and proof[:2] != (binding, digest):
-                return report | dict(status='invalid_evidence')
+            if proof:
+                # Only passing, well-formed evidence can have been journaled.
+                report['status'] = 'invalid_evidence'
+                if (proof[:2] != (binding, digest) or not re.fullmatch('[a-f0-9]{40}', proof[2])
+                        or proof[2] == p.revision):
+                    return report
             evidence = json.loads(proof[3]) if proof else self.gate(p, data)
             fields = {'commands', 'edit_sha256', 'tree', 'baseline', 'protected', 'inspected_image',
                       'image', 'status', 'container', 'exit', 'duration_ms'}
@@ -133,10 +137,11 @@ class Draft:
                 return report
             report.update({k: evidence[k] for k in ('container', 'exit', 'duration_ms')},
                           changed=[p.source], edit_sha256=digest, gate=p.commands or 'exact_stdout')
-            if evidence.get('status') == 'failed':
+            if not proof and evidence.get('status') == 'failed':
                 return report | dict(status='test_failed')
             if evidence.get('status') != 'passed' or evidence['exit'] != 0:
                 return report
+            report['status'] = 'not_run'
             branch = 'setupai/{number}-{run_id}'.format(**claim)
             if remote.ref(p.repo, p.base) != p.revision:
                 return report | dict(status='remote_conflict')
@@ -162,8 +167,8 @@ class Draft:
                 return remote.ref(p.repo, branch), remote.drafts(p.repo, branch)
             def attempt(kind, write, *args):
                 nonlocal unconfirmed
-                recheck((p.repo, branch, head) if kind == 'pr' else None)
                 verify_commit()
+                recheck((p.repo, branch, head) if kind == 'pr' else None)
                 with closing(sqlite3.connect(self.journal)) as db, db:
                     db.execute('CREATE TABLE IF NOT EXISTS intent (run TEXT, kind TEXT, PRIMARY KEY(run,kind))')
                     if not db.execute('INSERT OR IGNORE INTO intent VALUES (?,?)', (claim['run_id'], kind)).rowcount:

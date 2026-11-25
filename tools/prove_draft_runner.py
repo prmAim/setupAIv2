@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 
 if __name__ == '__main__':
+    if not __debug__:
+        raise SystemExit('Native proof requires assertions; run without -O or -OO.')
     gate = runpy.run_path(str(Path(__file__).with_name('docker_gate.py')))
     cli = (Path.home() / 'AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe'
            if os.name == 'nt' else Path('/usr/bin/docker'))

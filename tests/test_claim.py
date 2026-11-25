@@ -132,6 +132,13 @@ class Claim(unittest.TestCase):
                 start.assert_not_called()
                 self.assertEqual(control.call_args.args[0][-3:-1], ['rm', '-f'])
 
+    def test_optimized_native_probe_refuses_before_docker(self):
+        script = Path(__file__).resolve().parents[1] / 'tools' / 'prove_draft_runner.py'
+        result = subprocess.run([sys.executable, '-I', '-O', '-B', str(script)], capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'without -O', result.stderr)
+        self.assertEqual(result.stdout, b'')
+
     def test_profile_executes_only_allowlisted_edit_and_reconciles_draft(self):
         from tools.claim_issue import run_profile
         from tools.draft import Draft, Profile
@@ -204,6 +211,20 @@ class Claim(unittest.TestCase):
         self.assertEqual(effects, [])
         self.remote.issue['state'] = 'open'
         pub.ref = original_ref
+        # Revoke during the last readback, after recovery has validated the saved head.
+        read_commit = pub.commit
+        reads = []
+        def revoke_on_second_read(repo, sha):
+            reads.append(sha)
+            if len(reads) == 2:
+                self.remote.issue['state'] = 'closed'
+            return read_commit(repo, sha)
+        pub.commit = revoke_on_second_read
+        self.assertEqual(invoke(propose, gate)['status'], 'diagnostic')
+        self.assertEqual(reads, [head, head])
+        self.assertEqual(effects, [])
+        pub.commit = read_commit
+        self.remote.issue['state'] = 'open'
         with self.assertRaises(Interrupted):
             invoke(propose, gate)
         def already_proposed(*_):
@@ -238,11 +259,16 @@ class Claim(unittest.TestCase):
                 broken[key] = wrong
                 journal.execute('UPDATE proof SET evidence=?', (json.dumps(broken),))
                 journal.commit()
-                self.assertNotEqual(invoke(already_proposed, gate)['status'], 'draft')
+                self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
             del broken['legacy'], broken['inspected_image']
             journal.execute('UPDATE proof SET evidence=?', (json.dumps(broken),))
             journal.commit()
-            self.assertNotEqual(invoke(already_proposed, gate)['status'], 'draft')
+            self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
+            for invalid in ('{', None, json.dumps(json.loads(saved) | {'tree': None}),
+                            json.dumps(json.loads(saved) | {'status': 'failed'})):
+                journal.execute('UPDATE proof SET evidence=?', (invalid,))
+                journal.commit()
+                self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
             journal.execute('UPDATE proof SET evidence=?', (saved,))
         pub.pr['number'] = 8
         self.assertEqual(invoke(propose, gate)['status'], 'remote_conflict')
