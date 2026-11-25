@@ -110,7 +110,8 @@ For `reason=media_type`, `media_class` describes only the declared type: `missin
 field cannot identify the live media class, body, source of the response or quota charge.
 Parameterized SSE still has to pass every stream and answer check. HTML and JSON are not fallbacks.
 
-On Windows the canary uses a selector loop for its own run only. Overlapping dummy loopback
+The listener stops watching for new connections before closing its socket. On Windows the canary
+uses a selector loop for its own run only. Overlapping dummy loopback
 connections reproduced a Python 3.13 Proactor accept assertion during listener shutdown;
 that local race does not explain the media class of a later HTTP response. Neither symptom
 requires another sign-in to verify the fix. Skip catalog-only: it cannot test Responses.

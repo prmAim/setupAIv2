@@ -1,6 +1,7 @@
 import base64
 import asyncio
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+import gc
 import io
 import json
 import os
@@ -65,6 +66,7 @@ class Listener(unittest.TestCase):
 
         async def local_only(stage, catalog_only):
             loop = asyncio.get_running_loop()
+            loop.set_debug(True)  # Report transport creation errors as well as callback failures.
             loops.append(loop)
             loop.set_exception_handler(lambda _, context: errors.append(context['message']))
             async with asyncio.timeout(15):
@@ -74,8 +76,10 @@ class Listener(unittest.TestCase):
             return 0
 
         with (patch.object(app, 'live', local_only), patch.object(app.sys.stdin, 'isatty', return_value=True),
-              patch('builtins.input', return_value='Continue with ChatGPT')):
+              patch('builtins.input', return_value='Continue with ChatGPT'),
+              patch('sys.unraisablehook', side_effect=lambda event: errors.append(event.exc_type.__name__))):
             self.assertEqual(app.main(['--catalog-only']), 0)
+            gc.collect()
         if os.name == 'nt':
             self.assertIsInstance(loops[0], asyncio.SelectorEventLoop)
         self.assertTrue(loops[0].is_closed())
@@ -83,6 +87,8 @@ class Listener(unittest.TestCase):
 
 
 class Canary(unittest.IsolatedAsyncioTestCase):
+    loop_factory = asyncio.SelectorEventLoop if os.name == 'nt' else None
+
     @classmethod
     def setUpClass(cls):
         cls.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import ssl
 import sys
 import threading
@@ -59,9 +60,11 @@ async def authorize(host, client, browser):
     loop = asyncio.get_running_loop()
     done = loop.create_future()
 
-    async def receive(reader, writer):
+    async def receive(conn):
+        writer = None
         try:
             async with asyncio.timeout(3):
+                reader, writer = await asyncio.open_connection(sock=conn, limit=8192)
                 headers = (await reader.readuntil(b'\r\n\r\n')).decode('ascii').split('\r\n')
                 method, target, version = headers[0].split(' ')
                 require(method == 'GET' and version in ('HTTP/1.0', 'HTTP/1.1'))
@@ -76,10 +79,18 @@ async def authorize(host, client, browser):
         except (KeyError, TypeError, ValueError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             pass  # Stray sockets and unrelated requests cannot consume the transaction.
         finally:
-            writer.close()
+            if writer is None:
+                conn.close()
+            else:
+                writer.close()
 
-    async with await asyncio.start_server(receive, '127.0.0.1', 0, limit=8192) as server:
-        uri = f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}/auth/callback'
+    # Accept only on readability; remove the reader before closing its socket.
+    # No pending accept can attach a transport to a closing asyncio.Server.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setblocking(False)
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(100)
+        uri = f'http://127.0.0.1:{listener.getsockname()[1]}/auth/callback'
         params = dict(client_id=client, ext_agent_host_id=host, response_type='code', redirect_uri=uri,
                       scope=SCOPES, resource=API, state=state, nonce=nonce, code_challenge_method='S256',
                       code_challenge=base64.urlsafe_b64encode(digest(verifier)).decode().rstrip('='))
@@ -96,9 +107,26 @@ async def authorize(host, client, browser):
             except RuntimeError:
                 pass  # Loop already closed after deadline.
 
+        def accept_client():
+            try:
+                conn, _ = listener.accept()
+            except (BlockingIOError, ConnectionAbortedError):
+                return  # Readiness can be stale if a peer disconnects.
+            except OSError as exc:
+                if not done.done():
+                    done.set_exception(exc)
+                return
+            conn.setblocking(False)
+            group.create_task(receive(conn))
+
         async with asyncio.timeout(CALLBACK_SECONDS):
-            threading.Thread(target=launch, daemon=True).start()
-            result = await done
+            async with asyncio.TaskGroup() as group:
+                loop.add_reader(listener, accept_client)
+                try:
+                    threading.Thread(target=launch, daemon=True).start()
+                    result = await done
+                finally:
+                    loop.remove_reader(listener)
             if result is None:
                 raise Denied()
             require(result)
