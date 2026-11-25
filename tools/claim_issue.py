@@ -72,7 +72,7 @@ def select_for_claim(name, profile, github):
     return select([name], {name: profile}, github, read_comments=remember, on_change=changed)
 
 
-def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, owner, state):
+def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, owner, state, execute=None):
     phase = 'verification' if resume else 'prewrite'
     try:
         if (profile['repo'] != approved_repo or type(owner) is not int or owner <= 0
@@ -102,9 +102,12 @@ def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, o
                     return selected
                 number = selected['number']
 
+            task = ''
             def issue_read(**kwargs):
+                nonlocal task
                 get_issue = ['--method', 'GET', f'repos/{approved_repo}/issues/{number}']
                 issue = github(get_issue)
+                task = (issue.get('title') or '') + '\n' + (issue.get('body') or '')
                 if type(issue['number']) is not int or issue['number'] != number:
                     raise Diagnostic('issue identity changed')
                 def stable_comments(adapter, path):
@@ -152,6 +155,11 @@ def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, o
             if known_id is None:
                 record.rename(record.with_name(f'{record.name}.{comment_id}'))
                 os.fsync(directory)
+            if execute is not None:
+                # A verification result returned outside this lock is not an execution grant.
+                phase = 'execution'
+                return execute(dict(repo=approved_repo, number=number, run_id=run_id,
+                                    owner=owner, claim_id=comment_id), task[:8192])
         return dict(status='verified_only' if resume else 'claimed', repo=approved_repo, number=number,
                     run_id=run_id, owner=owner)
     except Diagnostic as error:
@@ -165,7 +173,7 @@ def command(argv):
     try:
         if (sys.platform != 'linux' or len(argv) not in (2, 3)
                 or not re.fullmatch('[a-zA-Z0-9_-]+', argv[0])
-                or not re.fullmatch('[a-f0-9]{32}', argv[1]) or argv[2:] not in ([], ['--resume'])):
+                or not re.fullmatch('[a-f0-9]{32}', argv[1]) or argv[2:] not in ([], ['--resume'], ['--draft'])):
             raise Diagnostic('expected PROFILE RUN_ID [--resume] on Linux')
         name, run = argv[:2]
         root = Path('/etc/setupAIv2')
@@ -200,8 +208,15 @@ def command(argv):
         def post(repository, number, body):
             return request('POST', f'/repos/{repository}/issues/{number}/comments', json.dumps(dict(body=body)))
 
+        execute = None
+        if argv[2:] == ['--draft']:
+            from .draft_operator import installed_draft
+            execute = installed_draft(root, name, repo, grant['revision'])
+            if execute.profile.base != profile['base']:
+                raise Diagnostic('draft base does not match selection profile')
         return run_profile(name, run, resume=bool(argv[2:]), profile=profile, github=gh, post=post,
-                           approved_repo=repo, owner=owner, state=Path('/var/lib/setupAIv2/claims') / repo.lower())
+                           approved_repo=repo, owner=owner, state=Path('/var/lib/setupAIv2/claims') / repo.lower(),
+                           execute=execute)
     except Diagnostic as error:
         return dict(status='diagnostic', phase='prewrite', reason=str(error))
     except (OSError, ValueError, TypeError, AttributeError, KeyError, http.client.HTTPException):
@@ -211,4 +226,4 @@ def command(argv):
 if __name__ == '__main__':
     result = command(sys.argv[1:])
     print(json.dumps(result))
-    sys.exit(2 if result['status'] == 'diagnostic' else 0)
+    sys.exit(2 if result['status'] == 'diagnostic' or (sys.argv[-1] == '--draft' and result['status'] != 'draft') else 0)

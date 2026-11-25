@@ -74,11 +74,153 @@ class Claim(unittest.TestCase):
         self.assertEqual(len(self.remote.log()), 1)
         self.assertIn(RUN, json.loads(self.remote.log()[0])['body'])
 
+    def test_verified_execution_keeps_guard_until_effects_finish(self):
+        import fcntl
+        from tools.claim_issue import run_profile
+
+        calls = []
+        def execute(claim, task):
+            calls.append(claim['claim_id'])
+            fd = os.open(self.state, os.O_DIRECTORY)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            return dict(status='not_run', **claim)
+
+        def resume():
+            return run_profile('example', RUN, resume=True, profile=PROFILE,
+                               github=self.remote.read, post=self.remote.post, approved_repo='owner/project',
+                               owner=123, state=self.state, execute=execute)
+
+        self.assertEqual(self.invoke()['status'], 'claimed')
+        self.assertEqual(resume()['status'], 'not_run')
+        self.remote.issue['state'] = 'closed'
+        self.assertEqual(resume()['status'], 'diagnostic')
+        self.assertEqual(calls, [42])
+
     def test_selection_pin_alone_never_authorizes_a_live_claim(self):
         from tools.claim_issue import command
         with patch.object(Path, 'read_text', side_effect=FileNotFoundError), patch('subprocess.run') as gh:
             self.assertEqual(command(['example', RUN])['status'], 'diagnostic')
             gh.assert_not_called()
+
+    def test_profile_executes_only_allowlisted_edit_and_reconciles_draft(self):
+        from tools.claim_issue import run_profile
+        from tools.draft import Draft, Profile
+        from hashlib import sha256
+
+        source = b'print(1)'
+        (self.root / 'solution.py').write_bytes(source)
+        (self.root / 'private').write_text('PRIVATE-MARKER')
+        image = 'sha256:' + '1' * 64
+        base, head = 'b' * 40, 'c' * 40
+        policy = Profile('owner/project', 'main', base, 'solution.py', sha256(source).hexdigest(),
+                         image, b'', b'2\n')
+        effects = []
+        class Interrupted(BaseException):
+            pass
+        class Publisher:
+            branch = pr = None
+            def prepare(_, claim, profile, data):
+                self.assertEqual(data, b'print(2)')
+                return head
+            def ref(_, repo, branch):
+                return base if branch == 'main' else _.branch
+            def create_ref(_, repo, branch, sha):
+                effects.append('ref'); _.branch = sha
+                raise Interrupted
+            def drafts(_, repo, branch):
+                return [_.pr] if _.pr else []
+            def create_draft(_, repo, branch, target, number):
+                effects.append('draft')
+                _.pr = dict(repo=repo, base_repo=repo, branch=branch, base=target, head=head,
+                            state='open', draft=True, number=7)
+                raise Interrupted
+        def propose(snapshot, task):
+            self.assertEqual(snapshot, {'solution.py': source})
+            return {'solution.py': b'print(2)'}
+        def gate(policy, data):
+            return dict(status='passed', image=image, container='2' * 64, exit=0, duration_ms=10)
+        pub = Publisher()
+        def invoke(model, runner):
+            return run_profile('example', RUN, resume=True, profile=PROFILE, github=self.remote.read,
+                               post=self.remote.post, approved_repo=policy.repo, owner=123, state=self.state,
+                               execute=Draft(policy, self.root, model, runner, pub, self.root / 'draft.sqlite'))
+        self.assertEqual(self.invoke()['status'], 'claimed')
+        self.assertEqual(invoke(lambda *_: {'private': b'edit'}, gate)['status'], 'invalid_edit')
+        self.assertEqual(invoke(propose, lambda *_: None)['status'], 'not_run')
+        self.assertEqual(effects, [])
+        with self.assertRaises(Interrupted):
+            invoke(propose, gate)
+        def already_proposed(*_):
+            self.fail('resume discarded the checked candidate')
+        with self.assertRaises(Interrupted):
+            invoke(already_proposed, gate)
+        for _ in range(2):
+            report = invoke(already_proposed, gate)
+            self.assertEqual(report['status'], 'draft')
+            self.assertEqual(report['head'], head)
+            self.assertEqual(report['pr'], 'https://github.com/owner/project/pull/7')
+            self.assertNotIn('PRIVATE-MARKER', repr(report))
+        self.assertEqual(effects, ['ref', 'draft'])
+        pub.pr['number'] = 8
+        self.assertEqual(invoke(propose, gate)['status'], 'remote_conflict')
+        pub.pr['number'] = 7
+        pub.pr['draft'] = False
+        self.assertEqual(invoke(propose, gate)['status'], 'remote_conflict')
+        pub.pr = None  # An absent read after an attempted write is not permission to replay.
+        self.assertEqual(invoke(propose, gate)['status'], 'write_unconfirmed')
+        self.assertEqual(effects, ['ref', 'draft'])
+
+    def test_installed_adapters_keep_role_credentials_out_of_profile_data(self):
+        from hashlib import sha256
+        from tools.claim_issue import run_profile
+        from tools.draft import Draft, Profile
+        from tools.draft_operator import codex
+        from tools.draft_github import GitHubDrafts
+        source = b'print(1)'
+        (self.root / 'a.py').write_bytes(source)
+        p = Profile('owner/project', 'main', 'a' * 40, 'a.py', sha256(source).hexdigest(),
+                    'sha256:' + '1' * 64, b'', b'2\n')
+        evidence = dict(status='passed', exit=0, duration_ms=1, image=p.image, container='f' * 64)
+        workflow = Draft(p, self.root, codex('model-only'), lambda *_: evidence,
+                         GitHubDrafts(p, self.root, 'publisher-only'), self.root / 'candidate.db')
+        self.assertEqual(self.invoke()['status'], 'claimed')
+        def invoke():
+            return run_profile('example', RUN, resume=True, profile=PROFILE, github=self.remote.read,
+                               post=self.remote.post, approved_repo=p.repo, owner=123, state=self.state, execute=workflow)
+        with (patch.dict(os.environ, {'TokenGitHub': 'private-marker'}),
+              patch('http.client.HTTPSConnection') as conn, patch('subprocess.run') as gh):
+            reply = conn.return_value.getresponse.return_value
+            for status, raw, expected in ((401, b'', 'auth_expired'), (429, json.dumps(dict(
+                    error=dict(code='insufficient_quota'))).encode(), 'quota_exhausted')):
+                reply.status = status
+                reply.read.return_value = raw
+                self.assertEqual(invoke()['status'], expected)
+                gh.assert_not_called()
+            conn.side_effect = ConnectionError
+            self.assertEqual(invoke()['status'], 'network_blocked')
+            conn.side_effect = None
+            reply.status = 200
+            reply.read.return_value = json.dumps(dict(status='completed', output=[dict(type='message',
+                content=[dict(type='output_text', text='print(2)')])])).encode()
+            gh.return_value = subprocess.CompletedProcess([], 0, b'[]')
+            self.assertEqual(invoke()['status'], 'remote_conflict')  # base ref absent: no writes
+            conn.assert_called_with('api.openai.com', timeout=60)
+            method, path, payload, headers = conn.return_value.request.call_args.args
+            self.assertEqual((method, path, headers['Authorization']), ('POST', '/v1/responses', 'Bearer model-only'))
+            self.assertEqual(json.loads(payload)['tools'], [])
+            self.assertNotIn('private-marker', payload)
+            self.assertNotIn('publisher-only', payload)
+            gh.assert_called_once()
+            args, opts = gh.call_args
+            self.assertEqual(args[0], ['/usr/bin/gh', 'api', '--hostname', 'github.com', '--method', 'GET',
+                                       'repos/owner/project/git/matching-refs/heads/main'])
+            self.assertEqual(opts['env']['GH_TOKEN'], 'publisher-only')
+            self.assertNotIn('TokenGitHub', opts['env'])
+            self.assertNotIn('model-only', repr(opts))
 
     def test_incomplete_or_changing_comment_pages_block_write_and_recovery(self):
         original = self.remote.read

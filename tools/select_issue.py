@@ -25,7 +25,8 @@ REPOSITORY = re.compile(r'[A-Za-z0-9_-]+/[A-Za-z0-9_-][A-Za-z0-9_.-]*')
 
 def gh(args):
     binary = 'C:/Program Files/GitHub CLI/gh.exe' if os.name == 'nt' else '/usr/bin/gh'
-    env = os.environ | {'GH_NO_UPDATE_NOTIFIER': '1', 'GH_PROMPT_DISABLED': '1'}
+    env = {k: os.environ[k] for k in ('GH_TOKEN', 'GITHUB_TOKEN', 'HOME', 'APPDATA', 'SystemRoot') if k in os.environ}
+    env.update(GH_NO_UPDATE_NOTIFIER='1', GH_PROMPT_DISABLED='1')
     operation = 'GitHub timeline query' if args[0] == 'graphql' else 'GitHub GET'
     try:
         output = subprocess.run([binary, 'api', '--hostname', 'github.com', *args], env=env,
