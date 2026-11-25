@@ -25,6 +25,7 @@ class Profile:
     expected: bytes
     project_tree: str = ''
     commands: tuple = ()
+    protected: tuple = ()  # Reviewed, complete non-editable path/SHA-256 pairs.
 
     def __post_init__(self):
         for value, pattern in ((self.repo, r'[\w-]+/[\w-]+'), (self.base, r'[a-zA-Z0-9_-]+'),
@@ -34,11 +35,16 @@ class Profile:
                 raise ValueError('invalid operator profile')
         if any(type(v) is not bytes or len(v) > LIMIT for v in (self.stdin, self.expected)):
             raise ValueError('invalid gate vector')
-        if self.commands or self.project_tree:
+        if self.commands or self.project_tree or self.protected:
             if (not re.fullmatch('[a-f0-9]{40}', self.project_tree) or not 1 <= len(self.commands) <= 4
                     or any(len(cmd) != 3 or cmd[:2] != ('-m', 'unittest') or not re.fullmatch(
                         r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+', cmd[2], re.ASCII) for cmd in self.commands)):
                 raise ValueError('unsupported project test profile')
+            pins = dict(self.protected)
+            if (type(self.protected) is not tuple or not pins or len(pins) != len(self.protected)
+                    or self.source in pins or any(not re.fullmatch('[a-f0-9]{64}', h) for h in pins.values())
+                    or any(cmd[2].replace('.', '/') + '.py' not in pins for cmd in self.commands)):
+                raise ValueError('missing protected project inputs')
 
     def snapshot(self, directory):
         # Root is operator-owned, not a user-supplied working directory.
@@ -83,7 +89,7 @@ class Draft:
         p, remote = self.profile, self.publisher
         report = dict(**claim, base=p.revision, image=p.image, head=None, status='not_run')
         unconfirmed = False
-        if p.repo != claim['repo']:
+        if p.repo != claim['repo'] or not p.commands or not p.protected:
             return report
         try:
             source = p.snapshot(self.directory)
@@ -112,10 +118,14 @@ class Draft:
             if proof and proof[:2] != (binding, digest):
                 return report | dict(status='invalid_evidence')
             evidence = json.loads(proof[3]) if proof else self.gate(p, data)
-            if not isinstance(evidence, dict) or evidence.get('image') != p.image:
+            fields = {'commands', 'edit_sha256', 'tree', 'baseline', 'protected', 'inspected_image',
+                      'image', 'status', 'container', 'exit', 'duration_ms'}
+            if not isinstance(evidence, dict) or set(evidence) != fields:
                 return report
-            if p.commands and (evidence.get('commands') != list(map(list, p.commands)) or evidence.get('edit_sha256') != digest
-                               or not re.fullmatch('[a-f0-9]{40}', evidence.get('tree', ''))):
+            if (evidence['image'] != p.image or evidence['inspected_image'] != p.image
+                    or evidence['baseline'] != p.project_tree or evidence['protected'] != dict(p.protected)
+                    or evidence['commands'] != list(map(list, p.commands)) or evidence['edit_sha256'] != digest
+                    or evidence['tree'] == p.project_tree or not re.fullmatch('[a-f0-9]{40}', evidence['tree'])):
                 return report
             if (not re.fullmatch('[a-f0-9]{64}', evidence.get('container', ''))
                     or type(evidence.get('exit')) is not int or type(evidence.get('duration_ms')) is not int
@@ -134,22 +144,26 @@ class Draft:
                 head = proof[2]
             else:
                 recheck()
-                head = remote.prepare(claim, p, data, **({'tested_tree': evidence['tree']} if p.commands else {}))
+                head = remote.prepare(claim, p, data, tested_tree=evidence['tree'])
             if not re.fullmatch('[a-f0-9]{40}', head) or head == p.revision:
                 return report
+            def verify_commit():
+                commit = remote.commit(p.repo, head)
+                if (commit['sha'] != head or commit['tree']['sha'] != evidence['tree']
+                        or [parent['sha'] for parent in commit['parents']] != [p.revision]):
+                    raise AdapterFailure('invalid_evidence')
+            verify_commit()
             if not proof:
                 with closing(sqlite3.connect(self.journal)) as db, db:
-                    saved = {k: evidence[k] for k in ('image', 'status', 'container', 'exit', 'duration_ms')}
-                    if p.commands:
-                        saved.update({k: evidence[k] for k in ('tree', 'edit_sha256', 'commands')})
                     db.execute('INSERT INTO proof VALUES (?,?,?,?,?)',
-                               (claim['run_id'], binding, digest, head, json.dumps(saved)))
+                               (claim['run_id'], binding, digest, head, json.dumps(evidence)))
             report.update(head=head, branch=branch)
             def observe():
                 return remote.ref(p.repo, branch), remote.drafts(p.repo, branch)
             def attempt(kind, write, *args):
                 nonlocal unconfirmed
                 recheck((p.repo, branch, head) if kind == 'pr' else None)
+                verify_commit()
                 with closing(sqlite3.connect(self.journal)) as db, db:
                     db.execute('CREATE TABLE IF NOT EXISTS intent (run TEXT, kind TEXT, PRIMARY KEY(run,kind))')
                     if not db.execute('INSERT OR IGNORE INTO intent VALUES (?,?)', (claim['run_id'], kind)).rowcount:
@@ -190,7 +204,7 @@ class Draft:
                     return report | dict(status='draft', pr='https://github.com/{}/pull/{}'.format(p.repo, pr['number']))
             return report | dict(status='remote_conflict')
         except AdapterFailure as exc:
-            if exc.args in [('quota_exhausted',), ('auth_expired',), ('network_blocked',)]:
+            if exc.args in [('quota_exhausted',), ('auth_expired',), ('network_blocked',), ('invalid_evidence',)]:
                 report['status'] = exc.args[0]
         except (ConnectionError, TimeoutError):
             report['status'] = 'write_unconfirmed' if unconfirmed else 'network_blocked'

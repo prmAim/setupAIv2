@@ -18,6 +18,17 @@ del _Selection
 RUN = 'a' * 32
 USER = {'type': 'User', 'id': 123}
 
+# Operator fixture pins; never taken from the runner response.
+PROJECT = ('d' * 40, (('-m', 'unittest', 'tests.check'),), (('tests/check.py', 'e' * 64),))
+STAGED = 'f' * 40
+
+
+def passed(p, edit):
+    from hashlib import sha256
+    return dict(status='passed', exit=0, duration_ms=1, image=p.image, inspected_image=p.image,
+                container='2' * 64, baseline=p.project_tree, protected=dict(p.protected), tree=STAGED,
+                commands=list(map(list, p.commands)), edit_sha256=sha256(edit).hexdigest())
+
 
 class Remote:
     def __init__(self, root):
@@ -106,6 +117,21 @@ class Claim(unittest.TestCase):
             self.assertEqual(command(['example', RUN])['status'], 'diagnostic')
             gh.assert_not_called()
 
+    def test_container_with_unknown_or_different_image_is_removed_without_start(self):
+        from tools.docker_gate import isolated, IMAGE
+        cid = 'a' * 64
+        spec = dict(Id=cid, Platform='linux', Mounts=[], Config=dict(Image=IMAGE, User='65534:65534'),
+                    HostConfig=dict(Privileged=False, NetworkMode='none', ReadonlyRootfs=True,
+                                    CapAdd=[], Devices=[], PidMode='', CapDrop=['ALL']))
+        for inspected in (spec, spec | dict(Image='sha256:' + 'b' * 64)):
+            with patch('subprocess.run') as control, patch('subprocess.Popen') as start:
+                replies = [json.dumps(['name=seccomp,profile=builtin']).encode(), cid.encode(),
+                           json.dumps([inspected]).encode(), b'']
+                control.side_effect = [subprocess.CompletedProcess([], 0, raw) for raw in replies]
+                self.assertIsNone(isolated(Path('/bin/docker'), '', b'', b''))
+                start.assert_not_called()
+                self.assertEqual(control.call_args.args[0][-3:-1], ['rm', '-f'])
+
     def test_profile_executes_only_allowlisted_edit_and_reconciles_draft(self):
         from tools.claim_issue import run_profile
         from tools.draft import Draft, Profile
@@ -117,13 +143,20 @@ class Claim(unittest.TestCase):
         image = 'sha256:' + '1' * 64
         base, head = 'b' * 40, 'c' * 40
         policy = Profile('owner/project', 'main', base, 'solution.py', sha256(source).hexdigest(),
-                         image, b'', b'2\n')
+                         image, b'', b'2\n', *PROJECT)
         effects = []
         class Interrupted(BaseException):
             pass
         class Publisher:
             branch = pr = None
-            def prepare(_, claim, profile, data):
+            parent = '9' * 40
+            commit_tree = STAGED
+            commit_head = head
+            def commit(_, repo, sha):
+                self.assertEqual(sha, head)
+                return dict(sha=_.commit_head, parents=[dict(sha=_.parent)], tree=dict(sha=_.commit_tree))
+            def prepare(_, claim, profile, data, *, tested_tree):
+                self.assertEqual(tested_tree, STAGED)
                 self.assertEqual(data, b'print(2)')
                 return head
             def ref(_, repo, branch):
@@ -142,7 +175,7 @@ class Claim(unittest.TestCase):
             self.assertEqual(snapshot, {'solution.py': source})
             return {'solution.py': b'print(2)'}
         def gate(policy, data):
-            return dict(status='passed', image=image, container='2' * 64, exit=0, duration_ms=10)
+            return passed(policy, data)
         pub = Publisher()
         original_ref = pub.ref
         def invoke(model, runner):
@@ -153,6 +186,15 @@ class Claim(unittest.TestCase):
         self.assertEqual(invoke(lambda *_: {'private': b'edit'}, gate)['status'], 'invalid_edit')
         self.assertEqual(invoke(propose, lambda *_: None)['status'], 'not_run')
         self.assertEqual(effects, [])
+        self.assertEqual(invoke(propose, gate)['status'], 'invalid_evidence')
+        self.assertEqual(effects, [])
+        pub.parent = base
+        for attr in ('commit_head', 'commit_tree'):
+            good = getattr(pub, attr)
+            setattr(pub, attr, '8' * 40)
+            self.assertEqual(invoke(propose, gate)['status'], 'invalid_evidence')
+            self.assertEqual(effects, [])
+            setattr(pub, attr, good)
         def revoked(repo, branch):
             if branch != 'main':
                 self.remote.issue['state'] = 'closed'
@@ -169,8 +211,12 @@ class Claim(unittest.TestCase):
         pub.ref = revoked
         self.assertEqual(invoke(already_proposed, gate)['status'], 'diagnostic')
         self.assertEqual(effects, ['ref'])
+        pub.commit_tree = '8' * 40
         self.remote.issue['state'] = 'open'
         pub.ref = original_ref
+        self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
+        self.assertEqual(effects, ['ref'])
+        pub.commit_tree = STAGED
         with self.assertRaises(Interrupted):
             invoke(already_proposed, gate)
         for _ in range(2):
@@ -180,6 +226,24 @@ class Claim(unittest.TestCase):
             self.assertEqual(report['pr'], 'https://github.com/owner/project/pull/7')
             self.assertNotIn('PRIVATE-MARKER', repr(report))
         self.assertEqual(effects, ['ref', 'draft'])
+        pub.parent = '9' * 40
+        self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
+        pub.parent = base
+        import sqlite3
+        with sqlite3.connect(self.root / 'draft.sqlite') as journal:
+            saved, = journal.execute('SELECT evidence FROM proof').fetchone()
+            for key, wrong in [('inspected_image', 'sha256:' + '8' * 64), ('protected', {}),
+                               ('baseline', '8' * 40), ('tree', '8' * 40), ('legacy', True)]:
+                broken = json.loads(saved)
+                broken[key] = wrong
+                journal.execute('UPDATE proof SET evidence=?', (json.dumps(broken),))
+                journal.commit()
+                self.assertNotEqual(invoke(already_proposed, gate)['status'], 'draft')
+            del broken['legacy'], broken['inspected_image']
+            journal.execute('UPDATE proof SET evidence=?', (json.dumps(broken),))
+            journal.commit()
+            self.assertNotEqual(invoke(already_proposed, gate)['status'], 'draft')
+            journal.execute('UPDATE proof SET evidence=?', (saved,))
         pub.pr['number'] = 8
         self.assertEqual(invoke(propose, gate)['status'], 'remote_conflict')
         pub.pr['number'] = 7
@@ -188,7 +252,6 @@ class Claim(unittest.TestCase):
         pub.pr = None  # An absent read after an attempted write is not permission to replay.
         self.assertEqual(invoke(propose, gate)['status'], 'write_unconfirmed')
         self.assertEqual(effects, ['ref', 'draft'])
-        import sqlite3
         with sqlite3.connect(self.root / 'draft.sqlite') as journal:
             journal.execute('UPDATE candidate SET data=?', (b'other candidate',))
         self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
@@ -204,8 +267,8 @@ class Claim(unittest.TestCase):
         source = b'print(1)'
         (self.root / 'a.py').write_bytes(source)
         p = Profile('owner/project', 'main', 'a' * 40, 'a.py', sha256(source).hexdigest(),
-                    'sha256:' + '1' * 64, b'', b'2\n')
-        evidence = dict(status='passed', exit=0, duration_ms=1, image=p.image, container='f' * 64)
+                    'sha256:' + '1' * 64, b'', b'2\n', *PROJECT)
+        evidence = passed(p, b'print(2)')
         workflow = Draft(p, self.root, lambda *_: {'a.py': b'print(2)'}, lambda *_: evidence,
                          GitHubDrafts(p, self.root, 'publisher-only'), self.root / 'candidate.db')
         self.assertEqual(self.invoke()['status'], 'claimed')

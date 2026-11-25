@@ -16,9 +16,16 @@ remote branch and open draft PR; it is not permission to merge.
 and 2 MiB) supplied as an operator-reviewed secret-free bundle. It checks the base tree
 OID, replaces only the approved file, stages all files in a bounded tmpfs and runs up to
 four operator-selected `python -B -m unittest MODULE` commands in the pinned Linux
-image. No mounts, image pull, network, host commands or package installation. Gate
-evidence records the staged tree, image, command list, edit digest, container, exit and
-duration. Publication checks the staged tree against the GitHub tree. The project tests
+image. No mounts, image pull, network, host commands or package installation. Before
+start, the broker verifies the created container's inspected image ID. The operator
+must independently pin the path and SHA-256 of every file except the editable source,
+including the selected test modules and fixture data. The journal records that manifest,
+baseline and staged trees, requested and inspected images, commands, edit digest,
+container, exit and duration. Reuse checks the evidence against the current profile;
+legacy stdout-only evidence cannot authorize publication. The publisher reads the
+prepared commit back by SHA and checks its identity, sole parent and tested tree on
+reuse and before creating a ref or draft. These checks protect input identity, not
+test execution from other Python code in the same interpreter. The project tests
 run as the same unprivileged user as the candidate; this is not a hidden or independently
 protected test service. General build systems and project-specific dependencies are not
 supported. The single-source stdout probe is not a substitute for project gate evidence.

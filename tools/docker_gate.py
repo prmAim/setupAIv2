@@ -47,9 +47,9 @@ def isolated(cli, bootstrap, payload, expected):
                            '-I', '-B', '-c', bootstrap).decode('ascii')
             if not re.fullmatch('[a-f0-9]{64}', cid):
                 return None
-            spec = json.loads(control('inspect', cid))[0]
+            spec, = json.loads(control('inspect', cid))
             host_cfg = spec['HostConfig']
-            if (spec['Id'] != cid or spec['Platform'] != 'linux' or spec['Mounts'] or host_cfg['Privileged']
+            if (spec['Id'] != cid or spec['Image'] != IMAGE or spec['Platform'] != 'linux' or spec['Mounts'] or host_cfg['Privileged']
                     or host_cfg['NetworkMode'] != 'none' or not host_cfg['ReadonlyRootfs']
                     or host_cfg['CapAdd'] or host_cfg['Devices'] or host_cfg['PidMode'] == 'host'
                     or spec['Config']['User'] != '65534:65534' or 'ALL' not in host_cfg['CapDrop']):
@@ -81,7 +81,7 @@ def isolated(cli, bootstrap, payload, expected):
                 return None
             passed = proc.returncode == 0 and result[0] == expected
             return dict(status='passed' if passed else 'failed', exit=proc.returncode, image=IMAGE,
-                        container=cid, duration_ms=int((time.monotonic() - start) * 1000))
+                        inspected_image=spec['Image'], container=cid, duration_ms=int((time.monotonic() - start) * 1000))
         except (OSError, subprocess.SubprocessError, ValueError, IndexError, KeyError, TypeError):
             return None
         finally:

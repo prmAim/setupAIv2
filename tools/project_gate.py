@@ -57,11 +57,17 @@ def project_gate(profile, edit, *, files, cli=Path('/usr/bin/docker')):
     if (profile.image != IMAGE or not profile.commands or not cli.is_absolute() or not 0 < len(edit) <= 65536
             or not 0 < len(files) <= 512 or sum(map(len, files.values())) > 2**21):
         return None
-    if tree_id(files) != profile.project_tree or sha256(files[profile.source]).hexdigest() != profile.digest:
+    files = files.copy()
+    if (profile.source not in files or any(type(v) is not bytes for v in files.values()) or type(edit) is not bytes
+            or tree_id(files) != profile.project_tree or sha256(files[profile.source]).hexdigest() != profile.digest):
         return None
     staged = files | {profile.source: edit}
+    protected = {k: sha256(v).hexdigest() for k, v in files.items() if k != profile.source}
+    if protected != dict(profile.protected):
+        return None
     encoded = {name: base64.b64encode(content).decode('ascii') for name, content in staged.items()}
     evidence = isolated(cli, BOOT, json.dumps([encoded, profile.commands]).encode(), b'passed\n')
     if evidence:
-        evidence.update(tree=tree_id(staged), edit_sha256=sha256(edit).hexdigest(), commands=list(map(list, profile.commands)))
+        evidence.update(baseline=profile.project_tree, protected=protected, tree=tree_id(staged),
+                        edit_sha256=sha256(edit).hexdigest(), commands=list(map(list, profile.commands)))
     return evidence

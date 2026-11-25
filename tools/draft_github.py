@@ -54,15 +54,20 @@ class GitHubDrafts:
                 return row['object']['sha']
         return None
 
-    def prepare(self, claim, p, data, *, tested_tree=None):
+    def commit(self, repo, sha):
+        if repo != self.profile.repo or not re.fullmatch('[0-9a-f]{40}', sha):
+            raise ValueError('outside commit scope')
+        return self._request('git/commits/' + sha)
+
+    def prepare(self, claim, p, data, *, tested_tree):
         if p != self.profile or claim['repo'] != p.repo:
             raise ValueError('unapproved profile')
         original = p.snapshot(self.directory)
-        parent = self._request('git/commits/' + p.revision)
+        parent = self.commit(p.repo, p.revision)
         if parent['sha'] != p.revision:
             raise ValueError('base changed')
         tree = parent['tree']['sha']
-        if p.project_tree and p.project_tree != tree:
+        if not p.protected or p.project_tree != tree:
             raise ValueError('tested project is not the complete base tree')
         if not re.fullmatch('[0-9a-f]{40}', tree):
             raise ValueError('invalid tree')
