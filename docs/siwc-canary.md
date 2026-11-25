@@ -98,11 +98,23 @@ synthetic not passed; stage=responses_post_attempted; plan_use=possible; reason=
 | --- | --- |
 | `http_NNN` | Non-200 status. A bounded JSON error may add a known `provider_code`; absence is inconclusive. |
 | `timeout`, `transport` | The operation timed out or the HTTP transport failed. Neither establishes billing. |
-| `media_type`, `encoding`, `size` | The response did not meet client media, encoding or byte limits. |
+| `media_type` | HTTP 200, but the declared media type was not `text/event-stream`. The check rejected it before reading the body. |
+| `encoding`, `size` | The response did not meet the client encoding or byte limits. |
 | `stream_interrupted`, `stream_invalid` | Missing completion/frame boundary, or an invalid/unexpected event, shape or sequence. |
 | `response_failed`, `response_incomplete`, `refusal`, `forbidden_item` | The provider reported failure (possibly with a known code), incomplete output, refusal, or an item outside the single final text contract. |
 | `wrong_answer` | All required boundaries agreed on the text, but its bytes were not the reviewed answer. |
 | `other` | No more specific safe category. |
+
+For `reason=media_type`, `media_class` describes only the declared type: `missing` (no type),
+`html` (`text/html`), `json` (`application/json`) or `other`. An older summary without this
+field cannot identify the live media class, body, source of the response or quota charge.
+Parameterized SSE still has to pass every stream and answer check. HTML and JSON are not fallbacks.
+
+On Windows the canary uses a selector loop for its own run only. Overlapping dummy loopback
+connections reproduced a Python 3.13 Proactor accept assertion during listener shutdown;
+that local race does not explain the media class of a later HTTP response. Neither symptom
+requires another sign-in to verify the fix. Skip catalog-only: it cannot test Responses.
+If a live result is necessary, authorize at most one fresh synthetic run and stop at its summary.
 
 Comments, multiline `data:`, framing metadata, UTF-8 BOM and standard SSE line endings do not
 change the answer bytes. Explicit commentary is not final text. No rejected output goes to Docker.

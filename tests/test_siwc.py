@@ -1,6 +1,6 @@
 import base64
 import asyncio
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -40,6 +40,46 @@ def stream():
 
 def wire(events):
     return ''.join('data: ' + json.dumps(e) + '\n\n' for e in events).encode()
+
+
+class Listener(unittest.TestCase):
+    def test_cli_loop_and_overlapping_callbacks(self):
+        errors, loops = [], []
+
+        def browser(url):
+            params = dict(parse_qsl(urlsplit(url).query))
+            uri = urlsplit(params['redirect_uri'])
+            address = ('127.0.0.1', uri.port)
+            with ExitStack() as sockets:
+                valid = sockets.enter_context(socket.create_connection(address, 2))
+                for _ in range(4):
+                    sockets.enter_context(socket.create_connection(address, 2))
+                query = urlencode(dict(state=params['state'], code='dummy'))
+                valid.sendall(f'GET {uri.path}?{query} HTTP/1.1\r\n\r\n'.encode())
+                for _ in range(8):  # Race additional accepts against listener close.
+                    try:
+                        sockets.enter_context(socket.create_connection(address, 0.05))
+                    except OSError:
+                        break
+            return True
+
+        async def local_only(stage, catalog_only):
+            loop = asyncio.get_running_loop()
+            loops.append(loop)
+            loop.set_exception_handler(lambda _, context: errors.append(context['message']))
+            async with asyncio.timeout(15):
+                for _ in range(20):
+                    _, form = await app.authorize('host', 'oaiapp_test', browser)
+                    self.assertEqual(form['code'], 'dummy')
+            return 0
+
+        with (patch.object(app, 'live', local_only), patch.object(app.sys.stdin, 'isatty', return_value=True),
+              patch('builtins.input', return_value='Continue with ChatGPT')):
+            self.assertEqual(app.main(['--catalog-only']), 0)
+        if os.name == 'nt':
+            self.assertIsInstance(loops[0], asyncio.SelectorEventLoop)
+        self.assertTrue(loops[0].is_closed())
+        self.assertEqual(errors, [])
 
 
 class Canary(unittest.IsolatedAsyncioTestCase):
@@ -239,15 +279,20 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                         raise httpx.ReadTimeout('private')
                     if mode == 'transport':
                         raise httpx.ReadError('private')
-                    if mode == 'media':
-                        return httpx.Response(200, headers={'content-type': 'text/private'})
+                    if mode in ('html', 'json_media', 'missing', 'other'):
+                        media = {'html': 'text/html; charset=UTF-8', 'json_media': 'application/json',
+                                 'other': 'text/private'}.get(mode)
+                        class Unread(httpx.AsyncByteStream):
+                            def __aiter__(self):
+                                raise AssertionError('rejected body read')
+                        return httpx.Response(200, headers={'content-type': media} if media else {}, stream=Unread())
                     if mode == 'size':
                         data = data.ljust(262145)
                     if mode == 'multiline':
                         data = data.replace(b', "sequence_number"', b',\ndata: "sequence_number"')
                     if mode == 'wrong':
                         data = data.replace(b'print(42)', b'private')
-                    return httpx.Response(200, headers={'content-type': 'text/event-stream'},
+                    return httpx.Response(200, headers={'content-type': 'text/event-stream; charset=utf-8'},
                                           stream=httpx.ByteStream(data))
             return httpx.Response(200, headers={'content-type': 'application/json'},
                                   stream=httpx.ByteStream(json.dumps(body).encode()))
@@ -277,11 +322,13 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                   patch.object(app, 'canary', lambda _, *args: original_canary(root, *args)),
                   patch.object(app.sys.stdin, 'isatty', return_value=True), patch.object(app, 'broker', broker),
                   patch('builtins.input', return_value='Continue with ChatGPT')):
-                reasons = dict(interrupted='stream_interrupted', wrong='wrong_answer', size='size', media='media_type',
+                reasons = dict(interrupted='stream_interrupted', wrong='wrong_answer', size='size',
                                admission='http_429; provider_code=insufficient_quota', unknown_code='http_429',
                                oversize_error='http_429', failed='response_failed; provider_code=server_error',
                                failed_private='response_failed', incomplete='response_incomplete', refusal='refusal',
                                reasoning='forbidden_item', unknown='forbidden_item', timeout='timeout', transport='transport')
+                reasons.update({mode: 'media_type; media_class=' + category for mode, category in
+                                [('html', 'html'), ('json_media', 'json'), ('missing', 'missing'), ('other', 'other')]})
                 for mode, count, result in [('exchange_failure', 1, 'stage=code_exchange; plan_use=not_attempted'),
                                             *((m, 1, 'stage=code_exchange; plan_use=not_attempted; reason=' + r)
                                               for m, (_, _, r) in exchanges.items()),

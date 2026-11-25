@@ -18,9 +18,10 @@ OAUTH_ERRORS = ('invalid_request', 'invalid_client', 'invalid_grant', 'unauthori
 
 
 class Rejected(ValueError):
-    def __init__(self, reason, error=None, *, oauth_error=None):
+    def __init__(self, reason, error=None, *, oauth_error=None, media_class=None):
         super().__init__()
         self.reason = reason if reason in REASONS else 'other'
+        self.media_class = media_class if media_class in ('missing', 'html', 'json', 'other') else None
         code = error.get('code') if isinstance(error, dict) else None
         self.code = code if code in PROVIDER_CODES else None
         self.oauth_error = oauth_error if oauth_error in OAUTH_ERRORS else None

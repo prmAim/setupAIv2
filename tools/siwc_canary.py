@@ -140,6 +140,9 @@ async def request(http, method, url, mime='application/json', *, limit=256 * 102
                 raise Rejected(reason, oauth_error=error)
             raise Rejected(reason, error)
         if media != mime:
+            if mime == 'text/event-stream':
+                category = {'': 'missing', 'text/html': 'html', 'application/json': 'json'}.get(media, 'other')
+                raise Rejected('media_type', media_class=category)
             raise Rejected('media_type')
         if encoding != 'identity':
             raise Rejected('encoding')
@@ -290,12 +293,16 @@ def main(args):
         if input(prompt + ' Type Continue with ChatGPT: ') != 'Continue with ChatGPT':
             print('cancelled; no sign-in or plan use')
             return 2
-        return asyncio.run(live(stage, catalog_only))
+        # Avoid a pending IOCP accept attaching after the callback listener closes.
+        factory = asyncio.SelectorEventLoop if sys.platform == 'win32' else None
+        return asyncio.run(live(stage, catalog_only), loop_factory=factory)
     except (Exception, KeyboardInterrupt) as exc:
         reason = ''
         if last in ('browser_authorization', 'code_exchange', 'identity_and_permissions', 'catalog', 'responses_post_attempted'):
             if isinstance(exc, Rejected):
                 reason = '; reason=' + exc.reason
+                if exc.media_class:
+                    reason += '; media_class=' + exc.media_class
                 if exc.code:
                     reason += '; provider_code=' + exc.code
                 if exc.oauth_error:
