@@ -1,5 +1,9 @@
 import base64
+import asyncio
+from contextlib import redirect_stdout
+import io
 import json
+import os
 import socket
 import tempfile
 import time
@@ -54,7 +58,8 @@ class Canary(unittest.IsolatedAsyncioTestCase):
         for fields in [dict(iss='foreign'), dict(aud='other'), dict(exp=0), dict(nonce='other'), dict(sub='')]:
             with self.subTest(fields=fields), self.assertRaises((jwt.InvalidTokenError, ValueError)):
                 app.identity(self.tokens(**fields), self.keys, 'oaiapp_test', 'n')
-        for changes in [dict(scope='openid'), dict(token_type='other'), dict(id_token='not-a-jwt')]:
+        for changes in [dict(scope='openid'), dict(scope=app.SCOPES + ' email'),
+                        dict(token_type='other'), dict(id_token='not-a-jwt')]:
             with self.assertRaises((jwt.InvalidTokenError, ValueError)):
                 app.identity(self.tokens() | changes, self.keys, 'oaiapp_test', 'n')
         wrong = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -92,6 +97,37 @@ class Canary(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.main([]), 0)
             self.assertEqual(app.main(['--run-synthetic', '--model=other']), 2)
 
+    def test_sse_framing(self):
+        raw = wire(stream())
+        self.assertEqual(answer(raw + b'data: [DONE]\n\n'), ANSWER)
+        for tail in [b'null', b'[]', b'42', b'false', b'{}', b'[DONE]\n\ndata: [DONE]']:
+            with self.assertRaises(ValueError):
+                answer(raw + b'data: ' + tail + b'\n\n')
+        key = json.dumps('type').encode() + b': '
+        nested = key + json.dumps('message').encode()
+        with self.assertRaises(ValueError):
+            answer(raw.replace(nested, key + json.dumps('function_call').encode() + b', ' + nested))
+
+    async def test_deadline_and_denial(self):
+        with patch.object(app, 'CALLBACK_SECONDS', 0.1), self.assertRaises(TimeoutError):
+            await app.authorize('host', app.NEW, lambda url: True)
+
+        def deny(url):
+            p = dict(parse_qsl(urlsplit(url).query))
+            uri = urlsplit(p['redirect_uri'])
+            with socket.create_connection((uri.hostname, uri.port), 3) as sock:
+                state = p['state']
+                sock.sendall(f'GET {uri.path}?state={state}&error=access_denied HTTP/1.1\r\n\r\n'.encode())
+            return True
+
+        with self.assertRaises(app.Denied):
+            await app.authorize('host', app.NEW, deny)
+
+    def test_preflight_blocks_prompt(self):
+        with patch.object(app, 'broker', return_value=None), patch('builtins.input', side_effect=AssertionError), redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(app.main(['--run-synthetic']), 1)
+        self.assertIn('stage=preflight; plan_use=not_attempted', out.getvalue())
+
     async def test_two_browser_transactions(self):
         attempts, calls = [], []
 
@@ -103,6 +139,12 @@ class Canary(unittest.IsolatedAsyncioTestCase):
             uri = urlsplit(params['redirect_uri'])
             self.assertEqual((uri.scheme, uri.hostname, uri.path), ('http', '127.0.0.1', '/auth/callback'))
             q = dict(state=params['state'], code='test-code')
+            for stray in ['', '/favicon.ico', uri.path + '?state=wrong&error=access_denied',
+                          uri.path + '?state=wrong&code=bad&client_id=oaiapp_fake']:
+                with socket.create_connection((uri.hostname, uri.port), 3) as sock:
+                    if stray:
+                        sock.sendall(f'GET {stray} HTTP/1.1\r\n\r\n'.encode())
+                        self.assertEqual(sock.recv(1), b'')
             if len(attempts) == 1:
                 q['client_id'] = 'oaiapp_test'
             with socket.create_connection((uri.hostname, uri.port), 3) as sock:
@@ -120,7 +162,9 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(form['resource'], app.API)
                 self.assertEqual(base64.urlsafe_b64encode(app.digest(form['code_verifier'])).decode().rstrip('='),
                                  p['code_challenge'])
-                body = self.tokens(nonce=p['nonce'])
+                if mode == 'exchange_failure':
+                    return httpx.Response(400)
+                body = self.tokens(nonce=p['nonce'], sub='another' if mode == 'mismatch' else 'account')
             elif req.url.path.endswith('/jwks.json'):
                 body = self.keys
             else:
@@ -130,7 +174,7 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                     payload = json.loads(req.content)
                     self.assertEqual(set(payload), {'model', 'input', 'store', 'stream'})
                     self.assertEqual((payload['model'], payload['store'], payload['stream']), ('test', False, True))
-                    data = wire(stream())
+                    data = wire(stream()[:-1] if mode == 'interrupted' else stream())
                     return httpx.Response(200, headers={'content-type': 'text/event-stream'},
                                           stream=httpx.ByteStream(data))
             return httpx.Response(200, headers={'content-type': 'application/json'},
@@ -138,15 +182,46 @@ class Canary(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'registration'
-            async with httpx.AsyncClient(transport=httpx.MockTransport(dispatch)) as http:
-                for _ in range(2):
-                    self.assertEqual(await app.canary(root, http, browser), ANSWER)
+            original_client, original_canary, original_broker = httpx.AsyncClient, app.canary, app.broker
+            def client(**kwargs):
+                return original_client(transport=httpx.MockTransport(dispatch), **kwargs)
+
+            def broker(data, expected):
+                if (data, expected) == (ANSWER, b'42\n'):
+                    if mode == 'runner_failure':
+                        return dict(status='failed', exit=1)
+                    self.assertEqual(mode, 'success')
+                else:
+                    self.assertEqual((data, expected), (b'print(17)\n', b'17\n'))
+                if os.environ.get('SETUPAI_TEST_LOCAL_BROKER') == '1':
+                    return original_broker(data, expected)
+                return dict(status='passed', exit=0, inspected_image=app.IMAGE, container='a' * 64)
+
+            full = [app.ISS + '/api/accounts/oauth/token', app.ISS + '/.well-known/jwks.json',
+                    app.API + '/models', app.API + '/responses']
+            with (patch.object(app.webbrowser, 'open_new', browser), patch.object(app.httpx, 'AsyncClient', client),
+                  patch.object(app, 'canary', lambda _, *args: original_canary(root, *args)),
+                  patch.object(app.sys.stdin, 'isatty', return_value=True), patch.object(app, 'broker', broker),
+                  patch('builtins.input', return_value='Continue with ChatGPT')):
+                for mode, count, result in [('exchange_failure', 1, 'stage=code_exchange; plan_use=not_attempted'),
+                                            ('success', 4, 'synthetic passed ' + app.IMAGE),
+                                            ('mismatch', 2, 'stage=identity_and_permissions; plan_use=not_attempted'),
+                                            ('interrupted', 4, 'stage=responses_post_attempted; plan_use=possible'),
+                                            ('runner_failure', 4, 'stage=runner; plan_use=possible')]:
+                    calls.clear()
+                    with redirect_stdout(io.StringIO()) as out:
+                        rc = await asyncio.to_thread(app.main, ['--run-synthetic'])
+                    self.assertEqual(rc, 0 if mode == 'success' else 1)
+                    self.assertIn(result, out.getvalue())
+                    self.assertNotIn('fake-bearer', out.getvalue())
+                    self.assertEqual(calls, full[:count])
+                    if mode == 'exchange_failure':
+                        self.assertFalse((root / 'registration.json').exists())
+                        self.assertEqual((root / 'pending-client-id').read_text(), 'oaiapp_test')
             self.assertEqual(set(p.name for p in root.iterdir()), {'host-id', 'registration.json'})
             self.assertEqual(json.loads((root / 'registration.json').read_text()),
                              ['oaiapp_test', app.digest('account').hex()])
-        self.assertEqual(calls, [app.ISS + '/api/accounts/oauth/token', app.ISS + '/.well-known/jwks.json',
-                                 app.API + '/models', app.API + '/responses'] * 2)
-        first, second = attempts
+        first, second = attempts[:2]
         self.assertEqual(first['client_id'], app.NEW)
         self.assertEqual(second['client_id'], 'oaiapp_test')
         self.assertNotIn('agent_name_hint', second)

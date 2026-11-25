@@ -3,6 +3,7 @@
 import json
 
 ANSWER = b'print(42)\n'
+DONE = object()
 
 
 def require(condition):
@@ -11,6 +12,11 @@ def require(condition):
 
 
 def events(raw):
+    def unique(pairs):
+        obj = dict(pairs)
+        require(len(obj) == len(pairs))
+        return obj
+
     text = raw.decode().replace('\r\n', '\n')
     require('\r' not in text and text.endswith('\n\n'))
     for frame in text[:-2].split('\n\n'):
@@ -24,9 +30,10 @@ def events(raw):
         data = lines[0][5:].strip()
         if data == '[DONE]':
             require(name is None)
-            yield None
+            yield DONE
         else:
-            event = json.loads(data)
+            event = json.loads(data, object_pairs_hook=unique)
+            require(isinstance(event, dict))
             require(name is None or name == event['type'])
             yield event
 
@@ -38,7 +45,7 @@ def answer(raw):
     def take(kind=None):
         nonlocal seq
         e = next(stream)
-        require(e and e['sequence_number'] == seq and (not kind or e['type'] == 'response.' + kind))
+        require(isinstance(e, dict) and e['sequence_number'] == seq and (not kind or e['type'] == 'response.' + kind))
         seq += 1
         return e
 
@@ -78,5 +85,5 @@ def answer(raw):
     r = take('completed')['response']
     require(r['id'] == rid and r['status'] == 'completed' and r['output'] == [msg]
             and not r.get('error') and not r.get('incomplete_details'))
-    require(list(stream) in ([], [None]))
+    require(list(stream) in ([], [DONE]))
     return text.encode()
