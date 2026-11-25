@@ -20,6 +20,10 @@ BOOT = ('import sys; b=sys.stdin.buffer; n=int.from_bytes(b.read(4)); '
 def docker_gate(profile, data, *, cli=Path('/usr/bin/docker')):
     if not cli.is_absolute() or profile.image != IMAGE or not 0 < len(data) <= 65536:
         return None
+    return isolated(cli, BOOT, len(data).to_bytes(4) + data + profile.stdin, profile.expected)
+
+
+def isolated(cli, bootstrap, payload, expected):
     name = 'setupai-' + uuid.uuid4().hex
     env = {'SystemRoot': os.environ['SystemRoot']} if os.name == 'nt' else {}
     host = 'npipe:////./pipe/docker_engine' if os.name == 'nt' else 'unix:///var/run/docker.sock'
@@ -38,9 +42,9 @@ def docker_gate(profile, data, *, cli=Path('/usr/bin/docker')):
                           '--network=none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
                           '--user=65534:65534', '--memory=96m', '--memory-swap=96m', '--pids-limit=12',
                           '--cpus=0.5', '--ipc=none', '--log-driver=none', '--no-healthcheck',
-                          '--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=1m', '--entrypoint=/usr/bin/env', IMAGE,
+                           '--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=8m', '--entrypoint=/usr/bin/env', IMAGE,
                           '-i', '/bin/busybox', 'timeout', '-s', 'KILL', '10', '/usr/local/bin/python',
-                          '-I', '-B', '-c', BOOT).decode('ascii')
+                           '-I', '-B', '-c', bootstrap).decode('ascii')
             if not re.fullmatch('[a-f0-9]{64}', cid):
                 return None
             spec = json.loads(control('inspect', cid))[0]
@@ -56,9 +60,9 @@ def docker_gate(profile, data, *, cli=Path('/usr/bin/docker')):
                 result = []
                 def exchange():
                     try:
-                        proc.stdin.write(len(data).to_bytes(4) + data + profile.stdin)
+                        proc.stdin.write(payload)
                         proc.stdin.close()
-                        result.append(proc.stdout.read(len(profile.expected) + 1))
+                        result.append(proc.stdout.read(len(expected) + 1))
                     except OSError:
                         pass
                 worker = threading.Thread(target=exchange, daemon=True)
@@ -75,7 +79,7 @@ def docker_gate(profile, data, *, cli=Path('/usr/bin/docker')):
             state = control('inspect', '--format', '{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}', cid)
             if state != f'exited {proc.returncode} false'.encode():
                 return None
-            passed = proc.returncode == 0 and result[0] == profile.expected
+            passed = proc.returncode == 0 and result[0] == expected
             return dict(status='passed' if passed else 'failed', exit=proc.returncode, image=IMAGE,
                         container=cid, duration_ms=int((time.monotonic() - start) * 1000))
         except (OSError, subprocess.SubprocessError, ValueError, IndexError, KeyError, TypeError):

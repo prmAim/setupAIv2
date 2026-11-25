@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from contextlib import closing
 from hashlib import sha256
+import json
 import os
 import re
 import stat
@@ -22,6 +23,8 @@ class Profile:
     image: str
     stdin: bytes
     expected: bytes
+    project_tree: str = ''
+    commands: tuple = ()
 
     def __post_init__(self):
         for value, pattern in ((self.repo, r'[\w-]+/[\w-]+'), (self.base, r'[a-zA-Z0-9_-]+'),
@@ -31,6 +34,11 @@ class Profile:
                 raise ValueError('invalid operator profile')
         if any(type(v) is not bytes or len(v) > LIMIT for v in (self.stdin, self.expected)):
             raise ValueError('invalid gate vector')
+        if self.commands or self.project_tree:
+            if (not re.fullmatch('[a-f0-9]{40}', self.project_tree) or not 1 <= len(self.commands) <= 4
+                    or any(len(cmd) != 3 or cmd[:2] != ('-m', 'unittest') or not re.fullmatch(
+                        r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+', cmd[2], re.ASCII) for cmd in self.commands)):
+                raise ValueError('unsupported project test profile')
 
     def snapshot(self, directory):
         # Root is operator-owned, not a user-supplied working directory.
@@ -57,15 +65,30 @@ class Draft:
     publisher: object
     journal: object
 
-    def __call__(self, claim, task):
+    def binding(self, claim):
+        return sha256(repr((self.profile, claim['repo'], claim['number'], claim['owner'], claim['claim_id'])).encode()).hexdigest()
+
+    def own_ref(self, claim):
+        if not self.journal.is_file():
+            return None
+        with closing(sqlite3.connect(self.journal)) as db:
+            if not db.execute('SELECT 1 FROM sqlite_master WHERE name=?', ('proof',)).fetchone():
+                return None
+            row = db.execute('SELECT head FROM proof WHERE run=? AND binding=?',
+                             (claim['run_id'], self.binding(claim))).fetchone()
+        if row and re.fullmatch('[a-f0-9]{40}', row[0]):
+            return claim['repo'], 'setupai/{number}-{run_id}'.format(**claim), row[0]
+
+    def __call__(self, claim, task, recheck):
         p, remote = self.profile, self.publisher
         report = dict(**claim, base=p.revision, image=p.image, head=None, status='not_run')
+        unconfirmed = False
         if p.repo != claim['repo']:
             return report
         try:
             source = p.snapshot(self.directory)
             report['profile_digest'] = sha256(repr(p).encode()).hexdigest()
-            binding = sha256(repr((p, claim['repo'], claim['number'], claim['owner'], claim['claim_id'])).encode()).hexdigest()
+            binding = self.binding(claim)
             with closing(sqlite3.connect(self.journal)) as db, db:
                 db.execute('CREATE TABLE IF NOT EXISTS candidate (run TEXT PRIMARY KEY, binding TEXT, data BLOB)')
                 row = db.execute('SELECT binding,data FROM candidate WHERE run=?', (claim['run_id'],)).fetchone()
@@ -82,15 +105,24 @@ class Draft:
                     return report | dict(status='invalid_edit')
                 if not row:
                     db.execute('INSERT INTO candidate VALUES (?,?,?)', (claim['run_id'], binding, data))
-            evidence = self.gate(p, data)
+            digest = sha256(data).hexdigest()
+            with closing(sqlite3.connect(self.journal)) as db, db:
+                db.execute('CREATE TABLE IF NOT EXISTS proof (run TEXT PRIMARY KEY, binding TEXT, digest TEXT, head TEXT, evidence TEXT)')
+                proof = db.execute('SELECT binding,digest,head,evidence FROM proof WHERE run=?', (claim['run_id'],)).fetchone()
+            if proof and proof[:2] != (binding, digest):
+                return report | dict(status='invalid_evidence')
+            evidence = json.loads(proof[3]) if proof else self.gate(p, data)
             if not isinstance(evidence, dict) or evidence.get('image') != p.image:
+                return report
+            if p.commands and (evidence.get('commands') != list(map(list, p.commands)) or evidence.get('edit_sha256') != digest
+                               or not re.fullmatch('[a-f0-9]{40}', evidence.get('tree', ''))):
                 return report
             if (not re.fullmatch('[a-f0-9]{64}', evidence.get('container', ''))
                     or type(evidence.get('exit')) is not int or type(evidence.get('duration_ms')) is not int
                     or evidence['duration_ms'] < 0):
                 return report
             report.update({k: evidence[k] for k in ('container', 'exit', 'duration_ms')},
-                          changed=[p.source], edit_sha256=sha256(data).hexdigest(), gate='exact_stdout')
+                          changed=[p.source], edit_sha256=digest, gate=p.commands or 'exact_stdout')
             if evidence.get('status') == 'failed':
                 return report | dict(status='test_failed')
             if evidence.get('status') != 'passed' or evidence['exit'] != 0:
@@ -98,23 +130,32 @@ class Draft:
             branch = 'setupai/{number}-{run_id}'.format(**claim)
             if remote.ref(p.repo, p.base) != p.revision:
                 return report | dict(status='remote_conflict')
-            with closing(sqlite3.connect(self.journal)) as db, db:
-                db.execute('CREATE TABLE IF NOT EXISTS prepared (run TEXT PRIMARY KEY, head TEXT)')
-                row = db.execute('SELECT head FROM prepared WHERE run=?', (claim['run_id'],)).fetchone()
-                head = row[0] if row else remote.prepare(claim, p, data)
-                if not row and re.fullmatch('[a-f0-9]{40}', head):
-                    db.execute('INSERT INTO prepared VALUES (?,?)', (claim['run_id'], head))
+            if proof:
+                head = proof[2]
+            else:
+                recheck()
+                head = remote.prepare(claim, p, data, **({'tested_tree': evidence['tree']} if p.commands else {}))
             if not re.fullmatch('[a-f0-9]{40}', head) or head == p.revision:
                 return report
+            if not proof:
+                with closing(sqlite3.connect(self.journal)) as db, db:
+                    saved = {k: evidence[k] for k in ('image', 'status', 'container', 'exit', 'duration_ms')}
+                    if p.commands:
+                        saved.update({k: evidence[k] for k in ('tree', 'edit_sha256', 'commands')})
+                    db.execute('INSERT INTO proof VALUES (?,?,?,?,?)',
+                               (claim['run_id'], binding, digest, head, json.dumps(saved)))
             report.update(head=head, branch=branch)
             def observe():
                 return remote.ref(p.repo, branch), remote.drafts(p.repo, branch)
             def attempt(kind, write, *args):
+                nonlocal unconfirmed
+                recheck((p.repo, branch, head) if kind == 'pr' else None)
                 with closing(sqlite3.connect(self.journal)) as db, db:
                     db.execute('CREATE TABLE IF NOT EXISTS intent (run TEXT, kind TEXT, PRIMARY KEY(run,kind))')
                     if not db.execute('INSERT OR IGNORE INTO intent VALUES (?,?)', (claim['run_id'], kind)).rowcount:
                         return False
                 try:
+                    unconfirmed = True
                     write(*args)
                 except (TimeoutError, ConnectionError):
                     pass  # Never infer success or retry here. Read the remote.
@@ -128,6 +169,7 @@ class Draft:
                     return report | dict(status='write_unconfirmed')
             if ref != head:
                 return report | dict(status='remote_conflict')
+            unconfirmed = False
             if prs == []:
                 if not attempt('pr', remote.create_draft, p.repo, branch, p.base, claim['number']):
                     return report | dict(status='write_unconfirmed')
@@ -150,6 +192,8 @@ class Draft:
         except AdapterFailure as exc:
             if exc.args in [('quota_exhausted',), ('auth_expired',), ('network_blocked',)]:
                 report['status'] = exc.args[0]
+        except (ConnectionError, TimeoutError):
+            report['status'] = 'write_unconfirmed' if unconfirmed else 'network_blocked'
         except (ValueError, OSError, KeyError, TypeError, sqlite3.Error):
             pass
         return report

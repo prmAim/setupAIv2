@@ -1,35 +1,31 @@
-# Verified draft run (single-file profile)
+# Draft workflow: partial implementation
 
-On a trusted Linux installation, `python -I -B /opt/setupAIv2/claim.py NAME RUN_ID --draft`
-continues an existing #29 intent under its repository lock. Plain `--resume` is still
-verification only. No credentials, profile or live target are provisioned by this change.
+The installed `claim.py NAME RUN_ID --draft` returns `not_run` before credential lookup,
+network calls or writes. There is no approved subscription transport and no API-key
+fallback. `--resume` remains verification only. Do not provision or copy model tokens.
 
-Operator-owned `/etc/setupAIv2/draft-profiles/NAME/policy.json` contains `repo`, `base`,
-`claim_profile_revision` (the approved selection revision), `revision` (base commit),
-`source` (one top-level Python file), `digest` (SHA-256 of the approved source bytes),
-`image` (the immutable image in `tools/docker_gate.py`), and the protected strings
-`stdin` and `expected`. Install the reviewed, secret-free base blob under `source/`
-beside the policy. No repository mirror, hidden tests, arbitrary commands or shell
-configuration are inputs. Only provision a profile for a repository whose existing
-push/PR automation is safe for untrusted changes. This tool does not modify workflows.
+The library operation keeps the single-host claim lock through side effects. Its caller
+must supply trusted authentication, proposal, gate and publication adapters. The model
+seam receives one bounded SHA-256-pinned source blob plus issue text, never a checkout.
+The operator-owned SQLite journal stores private candidate bytes, passing gate evidence,
+the corresponding prepared head, publication intents and the confirmed PR number.
+Do not delete ambiguous intents to force a retry. A recovered result requires an exact
+remote branch and open draft PR; it is not permission to merge.
 
-Use private operator-owned directories, including `/var/lib/setupAIv2/drafts/OWNER/REPO/`
-and `/etc/setupAIv2/draft-credentials/OWNER/REPO/` (lowercase repository). The latter
-holds separate `openai-api-key` and repo-scoped `publish-token` files. Model access is
-opt-in Responses API access, **not** subscription login. The model gets only bounded
-issue data and the approved source; there are no tools or filesystem capabilities.
-The publisher uses only fixed GitHub API operations. Do not give the runner either
-credential. The broker needs the pinned Linux/amd64 image preinstalled and a trusted
-local Docker daemon with seccomp. No image pull or host test fallback occurs at run time.
+`project_gate` supports complete regular-file Git trees (100644 only, at most 512 files
+and 2 MiB) supplied as an operator-reviewed secret-free bundle. It checks the base tree
+OID, replaces only the approved file, stages all files in a bounded tmpfs and runs up to
+four operator-selected `python -B -m unittest MODULE` commands in the pinned Linux
+image. No mounts, image pull, network, host commands or package installation. Gate
+evidence records the staged tree, image, command list, edit digest, container, exit and
+duration. Publication checks the staged tree against the GitHub tree. The project tests
+run as the same unprivileged user as the candidate; this is not a hidden or independently
+protected test service. General build systems and project-specific dependencies are not
+supported. The single-source stdout probe is not a substitute for project gate evidence.
 
-The fixed gate executes the candidate with the supplied input and compares exact stdout
-outside the container. It is not a general repository test suite. Report `draft` means
-only that this gate passed and the exact open draft was observed; it is not CI approval.
-The SQLite journal retains sensitive candidate bytes, prepared head, write intents and
-confirmed PR number. Keep it private and intact. An unconfirmed intent with no remote
-effect requires operator reconciliation; do not delete it and rerun blindly.
-
-Offline unit tests use a capability-limited remote, not GitHub. For an independent native
-runner check, run the trusted `tools/prove_draft_runner.py` with `python -I -B`.
-It needs no model or GitHub credential. It reports actual Docker IDs and exits nonzero
-if the isolation probe or deliberate output mismatch does not behave as expected.
+`python -I -B tools/prove_draft_runner.py` runs the trusted Docker broker with benign
+native fixtures (matching and failing project tests, incomplete tree, access markers).
+The profile-operation tests use a hermetic GitHub fixture. Neither is evidence of a
+live solver/publisher run. Before enabling a real target: approve and prove a restricted
+subscription adapter, pin its dependency image and complete tree, and verify the
+claim-to-draft path including remote crash recovery in an authorized test repository.

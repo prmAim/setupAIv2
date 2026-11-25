@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import runpy
+import sys
+from hashlib import sha256
 from types import SimpleNamespace
 
 
@@ -35,5 +37,25 @@ except OSError:
     green = gate['docker_gate'](profile, fixture, cli=cli)
     profile.expected = b'different\n'
     red = gate['docker_gate'](profile, fixture, cli=cli)
-    print(json.dumps(dict(matching=green, mismatch=red)))
-    raise SystemExit(0 if green and green['status'] == 'passed' and red and red['status'] == 'failed' else 1)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tools.project_gate import project_gate, tree_id
+    from tools.draft import Profile
+    files = {'answer.py': b'answer = 0', 'expected.txt': b'42', 'tests/__init__.py': b'',
+             'tests/test_answer.py': b'''import unittest
+from pathlib import Path
+from answer import answer
+class Check(unittest.TestCase):
+    def test_answer(self):
+        self.assertEqual(answer, int(Path('expected.txt').read_text()))
+'''}
+    policy = Profile('fixture/project', 'main', 'a' * 40, 'answer.py', sha256(files['answer.py']).hexdigest(),
+                     gate['IMAGE'], b'', b'', tree_id(files), (('-m', 'unittest', 'tests.test_answer'),))
+    project_ok = project_gate(policy, b'answer = 42', files=files, cli=cli)
+    project_red = project_gate(policy, b'answer = 41', files=files, cli=cli)
+    del files['expected.txt']
+    incomplete = project_gate(policy, b'answer = 42', files=files, cli=cli)
+    print(json.dumps(dict(matching=green, mismatch=red, project=project_ok, project_mismatch=project_red,
+                          incomplete=incomplete)))
+    raise SystemExit(0 if green and green['status'] == 'passed' and red and red['status'] == 'failed'
+                     and project_ok and project_ok['status'] == 'passed' and project_red
+                     and project_red['status'] == 'failed' and incomplete is None else 1)

@@ -72,7 +72,7 @@ def select_for_claim(name, profile, github):
     return select([name], {name: profile}, github, read_comments=remember, on_change=changed)
 
 
-def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, owner, state, execute=None):
+def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, owner, state, execute=None, authenticate=None):
     phase = 'verification' if resume else 'prewrite'
     try:
         if (profile['repo'] != approved_repo or type(owner) is not int or owner <= 0
@@ -151,15 +151,23 @@ def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, o
                     raise Diagnostic('invalid comment ID in POST response')
                 record.rename(record.with_name(f'{record.name}.{known_id}'))
                 os.fsync(directory)
-            comment_id = verify(issue_read, body, owner, known_id)
+            identity = dict(repo=approved_repo, number=number, run_id=run_id, owner=owner, claim_id=known_id)
+            own_ref = execute.own_ref(identity) if known_id and hasattr(execute, 'own_ref') else None
+            comment_id = verify(lambda **kw: issue_read(own_ref=own_ref, **kw), body, owner, known_id)
             if known_id is None:
                 record.rename(record.with_name(f'{record.name}.{comment_id}'))
                 os.fsync(directory)
             if execute is not None:
                 # A verification result returned outside this lock is not an execution grant.
                 phase = 'execution'
+                def recheck(own_ref=None):
+                    actor = authenticate() if authenticate else None
+                    if not isinstance(actor, dict) or actor.get('type') != 'User' or type(actor.get('id')) is not int or actor['id'] != owner:
+                        raise Diagnostic('execution identity not confirmed')
+                    verify(lambda **kw: issue_read(own_ref=own_ref, **kw), body, owner, comment_id)
+                recheck(own_ref)
                 return execute(dict(repo=approved_repo, number=number, run_id=run_id,
-                                    owner=owner, claim_id=comment_id), task[:8192])
+                                    owner=owner, claim_id=comment_id), task[:8192], recheck)
         return dict(status='verified_only' if resume else 'claimed', repo=approved_repo, number=number,
                     run_id=run_id, owner=owner)
     except Diagnostic as error:
@@ -176,6 +184,8 @@ def command(argv):
                 or not re.fullmatch('[a-f0-9]{32}', argv[1]) or argv[2:] not in ([], ['--resume'], ['--draft'])):
             raise Diagnostic('expected PROFILE RUN_ID [--resume] on Linux')
         name, run = argv[:2]
+        if argv[2:] == ['--draft']:
+            return dict(status='not_run', reason='no approved isolated subscription transport', run_id=run)
         root = Path('/etc/setupAIv2')
         grants = json.loads((root / 'claim-profiles.json').read_text(), object_pairs_hook=unique_object)
         grant = grants[name]
@@ -208,15 +218,8 @@ def command(argv):
         def post(repository, number, body):
             return request('POST', f'/repos/{repository}/issues/{number}/comments', json.dumps(dict(body=body)))
 
-        execute = None
-        if argv[2:] == ['--draft']:
-            from .draft_operator import installed_draft
-            execute = installed_draft(root, name, repo, grant['revision'])
-            if execute.profile.base != profile['base']:
-                raise Diagnostic('draft base does not match selection profile')
         return run_profile(name, run, resume=bool(argv[2:]), profile=profile, github=gh, post=post,
-                           approved_repo=repo, owner=owner, state=Path('/var/lib/setupAIv2/claims') / repo.lower(),
-                           execute=execute)
+                           approved_repo=repo, owner=owner, state=Path('/var/lib/setupAIv2/claims') / repo.lower())
     except Diagnostic as error:
         return dict(status='diagnostic', phase='prewrite', reason=str(error))
     except (OSError, ValueError, TypeError, AttributeError, KeyError, http.client.HTTPException):

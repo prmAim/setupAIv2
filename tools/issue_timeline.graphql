@@ -1,7 +1,7 @@
 query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
-      linkedBranches(first: 1) { totalCount }
+      linkedBranches(first: 1) { totalCount nodes { ref { name repository { nameWithOwner } target { oid } } } }
       closedByPullRequestsReferences(first: 1, includeClosedPrs: false) { totalCount }
       timelineItems(first: 100, after: $endCursor, itemTypes: [LABELED_EVENT, UNLABELED_EVENT, CROSS_REFERENCED_EVENT]) {
         totalCount

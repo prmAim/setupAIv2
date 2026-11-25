@@ -54,7 +54,7 @@ class GitHubDrafts:
                 return row['object']['sha']
         return None
 
-    def prepare(self, claim, p, data):
+    def prepare(self, claim, p, data, *, tested_tree=None):
         if p != self.profile or claim['repo'] != p.repo:
             raise ValueError('unapproved profile')
         original = p.snapshot(self.directory)
@@ -62,6 +62,8 @@ class GitHubDrafts:
         if parent['sha'] != p.revision:
             raise ValueError('base changed')
         tree = parent['tree']['sha']
+        if p.project_tree and p.project_tree != tree:
+            raise ValueError('tested project is not the complete base tree')
         if not re.fullmatch('[0-9a-f]{40}', tree):
             raise ValueError('invalid tree')
         listing = self._request('git/trees/' + tree)
@@ -72,7 +74,7 @@ class GitHubDrafts:
             raise ValueError('source is not the approved base blob')
         new = self._request('git/trees', dict(base_tree=tree, tree=[dict(path=p.source, mode='100644',
                                  type='blob', content=data.decode('utf-8'))]))['sha']
-        if not re.fullmatch('[a-f0-9]{40}', new):
+        if not re.fullmatch('[a-f0-9]{40}', new) or (p.project_tree and new != tested_tree):
             raise ValueError('unknown tree')
         actor = dict(name='SetupAI', email='setupai@users.noreply.github.com', date=parent['committer']['date'])
         commit = self._request('git/commits', dict(message='Draft run ' + claim['run_id'], parents=[p.revision],
