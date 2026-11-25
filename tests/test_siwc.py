@@ -170,6 +170,11 @@ class Canary(unittest.IsolatedAsyncioTestCase):
             else:
                 self.assertEqual(req.headers['authorization'], 'Bearer fake-bearer')
                 body = dict(models=[dict(slug='test', visibility='list')])
+                if mode == 'catalog_only':
+                    body['models'] = [dict(slug=f'private-{i}', visibility='list', description='x' * 4096)
+                                      for i in range(65)]
+                if mode == 'forbidden':
+                    return httpx.Response(403)
                 if req.url.path.endswith('/responses'):
                     payload = json.loads(req.content)
                     self.assertEqual(set(payload), {'model', 'input', 'store', 'stream'})
@@ -187,6 +192,7 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                 return original_client(transport=httpx.MockTransport(dispatch), **kwargs)
 
             def broker(data, expected):
+                self.assertNotIn(mode, ('catalog_only', 'forbidden'))
                 if (data, expected) == (ANSWER, b'42\n'):
                     if mode == 'runner_failure':
                         return dict(status='failed', exit=1)
@@ -207,11 +213,14 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                                             ('success', 4, 'synthetic passed ' + app.IMAGE),
                                             ('mismatch', 2, 'stage=identity_and_permissions; plan_use=not_attempted'),
                                             ('interrupted', 4, 'stage=responses_post_attempted; plan_use=possible'),
-                                            ('runner_failure', 4, 'stage=runner; plan_use=possible')]:
+                                            ('runner_failure', 4, 'stage=runner; plan_use=possible'),
+                                            ('forbidden', 3, 'stage=catalog; plan_use=not_attempted; reason=http_403'),
+                                            ('catalog_only', 3, 'catalog passed; plan_use=not_attempted')]:
                     calls.clear()
                     with redirect_stdout(io.StringIO()) as out:
-                        rc = await asyncio.to_thread(app.main, ['--run-synthetic'])
-                    self.assertEqual(rc, 0 if mode == 'success' else 1)
+                        diagnostic = mode in ('catalog_only', 'forbidden')
+                        rc = await asyncio.to_thread(app.main, ['--catalog-only' if diagnostic else '--run-synthetic'])
+                    self.assertEqual(rc, 0 if mode in ('success', 'catalog_only') else 1)
                     self.assertIn(result, out.getvalue())
                     self.assertNotIn('fake-bearer', out.getvalue())
                     self.assertEqual(calls, full[:count])
@@ -243,3 +252,41 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await app.request(http, 'GET', app.API + '/models')
             self.assertEqual(len(calls), 1)
+
+    async def test_catalog_diagnostics(self):
+        valid = b'{"models":[{"visibility":"list","slug":"private"}]}'
+        boundary = valid.ljust(4 * 1024 * 1024)
+        for fixture, headers, expected in [
+            (boundary, {}, None), (boundary + b' ', {}, 'size'),
+            (valid, {'content-type': 'text/private'}, 'media_type'),
+            (valid, {'content-encoding': 'private'}, 'encoding'),
+            (b'private', {}, 'invalid_json'), (b'{"data":[]}', {}, 'malformed_shape'),
+            (b'{"models":{}}', {}, 'malformed_shape'), (b'{"models":[null]}', {}, 'malformed_shape'),
+            (b'{"models":[{"visibility":"list"}]}', {}, 'malformed_shape'),
+            (b'{"models":[{"visibility":"hidden"}]}', {}, 'no_eligible'),
+            (httpx.ReadTimeout('private'), {}, 'timeout'), (TimeoutError('private'), {}, 'timeout'),
+            (httpx.ConnectError('private'), {}, 'transport'),
+        ]:
+            def dispatch(req):
+                if isinstance(fixture, Exception):
+                    raise fixture
+                return httpx.Response(200, headers={'content-type': 'application/json'} | headers,
+                                      stream=httpx.ByteStream(fixture))
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(dispatch)) as http:
+                if expected is None:
+                    self.assertEqual(await app.discover(http, {}), 'private')
+                else:
+                    with self.assertRaises(app.Rejected) as caught:
+                        await app.discover(http, {})
+                    self.assertEqual(caught.exception.reason, expected)
+
+    def test_catalog_only_requires_consent(self):
+        for tty, consent in [(False, 'Continue with ChatGPT'), (True, 'no')]:
+            with (patch.object(app.sys.stdin, 'isatty', return_value=tty),
+                  patch('builtins.input', return_value=consent) as prompt,
+                  patch.object(app, 'broker') as broker, patch.object(app, 'live') as live):
+                self.assertEqual(app.main(['--catalog-only']), 2)
+                self.assertEqual(prompt.called, tty)
+                broker.assert_not_called()
+                live.assert_not_called()

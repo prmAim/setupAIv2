@@ -29,6 +29,17 @@ SCOPES = 'openid resource.invoke chatgpt.tokens.use.direct'
 NEW = 'dynamic_agent_client'
 CLIENT = r'oaiapp_[A-Za-z0-9_-]{1,200}'
 CALLBACK_SECONDS = 150
+CATALOG_LIMIT = 4 * 1024 * 1024
+HTTP_REASONS = {i: f'http_{i}' for i in range(100, 600)}
+REASONS = frozenset(HTTP_REASONS.values()) | {
+    'http_other', 'timeout', 'transport', 'media_type', 'encoding', 'size',
+    'invalid_json', 'malformed_shape', 'no_eligible',
+}
+
+
+class Rejected(ValueError):
+    def __init__(self, reason):
+        self.reason = reason if reason in REASONS else 'other'
 
 
 class Denied(ValueError):
@@ -106,15 +117,44 @@ async def authorize(host, client, browser):
                        code_verifier=verifier, redirect_uri=uri, resource=API)
 
 
-async def request(http, method, url, mime='application/json', **kwargs):
+async def request(http, method, url, mime='application/json', *, limit=256 * 1024, **kwargs):
     async with asyncio.timeout(45), http.stream(method, url, **kwargs) as response:
-        require(response.status_code == 200 and response.headers.get('content-type', '').split(';')[0] == mime
-                and response.headers.get('content-encoding', 'identity') == 'identity')
+        if response.status_code != 200:
+            raise Rejected(HTTP_REASONS.get(response.status_code, 'http_other'))
+        if response.headers.get('content-type', '').split(';')[0].strip().lower() != mime:
+            raise Rejected('media_type')
+        if response.headers.get('content-encoding', 'identity').strip().lower() != 'identity':
+            raise Rejected('encoding')
         data = bytearray()
         async for chunk in response.aiter_raw():
-            require(len(data) + len(chunk) <= 256 * 1024)
+            if len(data) + len(chunk) > limit:
+                raise Rejected('size')
             data.extend(chunk)
-        return json.loads(data) if mime == 'application/json' else answer(data)
+        if mime != 'application/json':
+            return answer(data)
+        try:
+            return json.loads(data)
+        except (ValueError, RecursionError):
+            raise Rejected('invalid_json') from None
+
+
+async def discover(http, headers):
+    try:
+        catalog = await request(http, 'GET', API + '/models', headers=headers, limit=CATALOG_LIMIT)
+    except (httpx.TimeoutException, TimeoutError):
+        raise Rejected('timeout') from None
+    except httpx.RequestError:
+        raise Rejected('transport') from None
+    if not isinstance(catalog, dict) or not isinstance(catalog.get('models'), list):
+        raise Rejected('malformed_shape')
+    for entry in catalog['models']:
+        if not isinstance(entry, dict) or not isinstance(entry.get('visibility'), str):
+            raise Rejected('malformed_shape')
+        if entry['visibility'] == 'list':
+            if not isinstance(entry.get('slug'), str) or not entry['slug'].strip():
+                raise Rejected('malformed_shape')
+            return entry['slug']
+    raise Rejected('no_eligible')
 
 
 def identity(tokens, keys, issued, nonce):
@@ -135,7 +175,7 @@ def create(path, text):
         file.write(text)
 
 
-async def canary(root, http, browser, stage=lambda name: None):
+async def canary(root, http, browser, stage=lambda name: None, catalog_only=False):
     root.mkdir(mode=0o700, exist_ok=True)
     hostfile = root / 'host-id'
     if not hostfile.exists():
@@ -170,9 +210,9 @@ async def canary(root, http, browser, stage=lambda name: None):
     pending.unlink(missing_ok=True)
     headers = {'Authorization': 'Bearer ' + tokens['access_token']}
     stage('catalog')
-    catalog = await request(http, 'GET', API + '/models', headers=headers)
-    model = next(m['slug'] for m in catalog['models'] if m['visibility'] == 'list')
-    require(isinstance(model, str) and model)
+    model = await discover(http, headers)
+    if catalog_only:
+        return None
     body = dict(model=model, store=False, stream=True, input=[dict(role='user', content=
                 'Return only the exact contents of synthetic answer.py: print(42) followed by one LF. No fences.')])
     stage('responses_post_attempted')
@@ -180,14 +220,17 @@ async def canary(root, http, browser, stage=lambda name: None):
                          headers=headers | {'Accept': 'text/event-stream'})
 
 
-async def live(stage):
+async def live(stage, catalog_only):
     root = Path.home() / '.setupai-siwc-canary'
     require(not root.resolve().is_relative_to(Path(__file__).resolve().parents[1]))
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     tls.load_verify_locations(certifi.where())
     async with httpx.AsyncClient(verify=tls, trust_env=False, follow_redirects=False, timeout=10,
                                  headers={'Accept-Encoding': 'identity'}) as http:
-        data = await canary(root, http, webbrowser.open_new, stage)
+        data = await canary(root, http, webbrowser.open_new, stage, catalog_only)
+    if catalog_only:
+        print('catalog passed; plan_use=not_attempted')
+        return 0
     stage('runner')
     proof = broker(data, b'42\n')
     require(proof and proof['status'] == 'passed')
@@ -205,7 +248,8 @@ def main(args):
     if not args:
         print('not_run')
         return 0
-    if args not in (['--preflight'], ['--run-synthetic']):
+    catalog_only = args == ['--catalog-only']
+    if not catalog_only and args not in (['--preflight'], ['--run-synthetic']):
         return 2
     last, possible = 'preflight', False
 
@@ -215,21 +259,27 @@ def main(args):
         possible |= name == 'responses_post_attempted'
 
     try:
-        proof = broker(b'print(17)\n', b'17\n')
-        require(proof and proof['status'] == 'passed')
-        print('preflight passed; no sign-in or plan use')
-        if args == ['--preflight']:
-            return 0
+        if not catalog_only:
+            proof = broker(b'print(17)\n', b'17\n')
+            require(proof and proof['status'] == 'passed')
+            print('preflight passed; no sign-in or plan use')
+            if args == ['--preflight']:
+                return 0
         stage('operator_consent')
         if not sys.stdin.isatty():
             print('interactive terminal required; no sign-in or plan use')
             return 2
-        if input('Use your ChatGPT plan for one synthetic request? Type Continue with ChatGPT: ') != 'Continue with ChatGPT':
+        prompt = 'Sign in for model discovery only?' if catalog_only else 'Use your ChatGPT plan for one synthetic request?'
+        if input(prompt + ' Type Continue with ChatGPT: ') != 'Continue with ChatGPT':
             print('cancelled; no sign-in or plan use')
             return 2
-        return asyncio.run(live(stage))
-    except (Exception, KeyboardInterrupt):
-        print('synthetic not passed; stage=' + last + '; plan_use=' + ('possible' if possible else 'not_attempted'))
+        return asyncio.run(live(stage, catalog_only))
+    except (Exception, KeyboardInterrupt) as exc:
+        reason = ''
+        if last == 'catalog':
+            reason = '; reason=' + (exc.reason if isinstance(exc, Rejected) else 'other')
+        mode = 'catalog' if catalog_only else 'synthetic'
+        print(mode + ' not passed; stage=' + last + '; plan_use=' + ('possible' if possible else 'not_attempted') + reason)
         return 1
 
 
