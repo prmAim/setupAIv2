@@ -116,19 +116,29 @@ async def bounded(response, limit):
     return data
 
 
-async def request(http, method, url, mime='application/json', *, limit=256 * 1024, **kwargs):
-    async with asyncio.timeout(45), http.stream(method, url, **kwargs) as response:
+async def request(http, method, url, mime='application/json', *, limit=256 * 1024, oauth=False, **kwargs):
+    async with asyncio.timeout(45) as deadline, http.stream(method, url, **kwargs) as response:
         media = response.headers.get('content-type', '').split(';')[0].strip().lower()
         encoding = response.headers.get('content-encoding', 'identity').strip().lower()
         if response.status_code != 200:
             error = None
-            if mime == 'text/event-stream' and media == 'application/json' and encoding == 'identity':
+            if (oauth or mime == 'text/event-stream') and media == 'application/json' and encoding == 'identity':
                 try:
-                    body = json.loads(await bounded(response, min(limit, 8192)))
+                    # Preserve the status if the optional diagnostic stalls. Transfer the
+                    # remaining read budget to a timeout we can handle here.
+                    end = deadline.when()
+                    deadline.reschedule(None)
+                    async with asyncio.timeout_at(end):
+                        body = json.loads(await bounded(response, min(limit, 8192)))
                     error = body.get('error') if isinstance(body, dict) else None
-                except (ValueError, RecursionError):
+                except (ValueError, RecursionError, TimeoutError, httpx.RequestError):
                     pass  # An unreadable diagnostic must not hide the HTTP status.
-            raise Rejected(HTTP_REASONS.get(response.status_code, 'http_other'), error)
+                finally:
+                    deadline.reschedule(end)  # Keep stream cleanup within the overall budget.
+            reason = HTTP_REASONS.get(response.status_code, 'http_other')
+            if oauth:
+                raise Rejected(reason, oauth_error=error)
+            raise Rejected(reason, error)
         if media != mime:
             raise Rejected('media_type')
         if encoding != 'identity':
@@ -203,7 +213,10 @@ async def canary(root, http, browser, stage=lambda name: None, catalog_only=Fals
     if client == NEW:
         create(pending, form['client_id'])  # Not an identity; never use it as proof of authorization.
     stage('code_exchange')
-    tokens = await request(http, 'POST', ISS + '/api/accounts/oauth/token', data=form)
+    tokens = await request(http, 'POST', ISS + '/api/accounts/oauth/token', oauth=True, data=form)
+    if not isinstance(tokens, dict) or not all(isinstance(tokens.get(k), str) and tokens[k]
+                                              for k in ('id_token', 'token_type', 'scope', 'access_token')):
+        raise Rejected('malformed_shape')
     stage('identity_and_permissions')
     keys = await request(http, 'GET', ISS + '/.well-known/jwks.json')
     verified = identity(tokens, keys, form['client_id'], nonce)
@@ -280,11 +293,17 @@ def main(args):
         return asyncio.run(live(stage, catalog_only))
     except (Exception, KeyboardInterrupt) as exc:
         reason = ''
-        if last in ('catalog', 'responses_post_attempted'):
+        if last in ('browser_authorization', 'code_exchange', 'identity_and_permissions', 'catalog', 'responses_post_attempted'):
             if isinstance(exc, Rejected):
                 reason = '; reason=' + exc.reason
                 if exc.code:
                     reason += '; provider_code=' + exc.code
+                if exc.oauth_error:
+                    reason += '; oauth_error=' + exc.oauth_error
+            elif isinstance(exc, Denied):
+                reason = '; reason=access_denied'
+            elif isinstance(exc, jwt.PyJWTError):
+                reason = '; reason=identity_invalid'
             elif isinstance(exc, (TimeoutError, httpx.TimeoutException)):
                 reason = '; reason=timeout'
             elif isinstance(exc, httpx.RequestError):

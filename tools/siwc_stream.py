@@ -12,14 +12,18 @@ REASONS = frozenset(HTTP_REASONS.values()) | {
     'forbidden_item', 'wrong_answer',
 }
 PROVIDER_CODES = ('insufficient_quota', 'rate_limit_exceeded', 'server_error', 'model_not_found')
+OAUTH_ERRORS = ('invalid_request', 'invalid_client', 'invalid_grant', 'unauthorized_client',
+                'unsupported_grant_type', 'invalid_scope', 'invalid_target', 'server_error',
+                'temporarily_unavailable', 'access_denied')
 
 
 class Rejected(ValueError):
-    def __init__(self, reason, error=None):
+    def __init__(self, reason, error=None, *, oauth_error=None):
         super().__init__()
         self.reason = reason if reason in REASONS else 'other'
         code = error.get('code') if isinstance(error, dict) else None
         self.code = code if code in PROVIDER_CODES else None
+        self.oauth_error = oauth_error if oauth_error in OAUTH_ERRORS else None
 
 
 def require(condition):

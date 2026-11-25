@@ -37,6 +37,22 @@ On catalog failure share only the terminal summary, for example
 `catalog not passed; stage=catalog; plan_use=not_attempted; reason=http_403`.
 The reason is a status code or a fixed category, not a provider explanation.
 
+At `5a205e8`, HTTP rejection, timeout and malformed JSON fixtures at code exchange
+all printed `stage=code_exchange; plan_use=not_attempted`. That line rules out a
+Responses request but cannot identify the original cause. Exchange failures now
+report `http_NNN` and optionally `oauth_error` (only a recognized top-level OAuth
+error string from at most 8 KiB of identity-encoded JSON). A status without that
+field is still useful. Without an HTTP rejection, `timeout`, `transport`,
+`media_type`, `encoding`, `size`, `invalid_json` and `malformed_shape` distinguish
+failures reading an exchange response from a response missing required fields.
+Share only the summary. Do not reset registration or replay a code. If the owner
+chooses a fresh sign-in for diagnosis, use the existing `--catalog-only` command,
+not `--run-synthetic`. From another directory, specify the reviewed worktree:
+
+```powershell
+uv run --offline --locked --directory C:\Git\_wf\siwc30 python -m tools.siwc_canary --catalog-only
+```
+
 On confirmation the app creates `~/.setupai-siwc-canary/host-id` (stable UUIDv4
 URN). A state-validated new registration saves only the issued ID in
 `pending-client-id` before code exchange. A failed exchange stops; a later manual

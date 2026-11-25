@@ -144,7 +144,18 @@ class Canary(unittest.IsolatedAsyncioTestCase):
         self.assertIn('stage=preflight; plan_use=not_attempted', out.getvalue())
 
     async def test_two_browser_transactions(self):
-        attempts, calls = [], []
+        attempts, calls, verifiers = [], [], set()
+        exchanges = {
+            'grant': (400, b'{"error":"invalid_grant","error_description":"private"}', 'http_400; oauth_error=invalid_grant'),
+            'client': (401, b'{"error":"invalid_client"}', 'http_401; oauth_error=invalid_client'),
+            'unknown_error': (400, b'{"error":"private"}', 'http_400'),
+            'nested_error': (403, b'{"error":{"code":"server_error"}}', 'http_403'),
+            'large_error': (400, b'{"error":"invalid_grant"}'.ljust(8193), 'http_400'),
+            'bad_error': (500, b'private', 'http_500'),
+            'json': (200, b'private', 'invalid_json'), 'shape': (200, b'{}', 'malformed_shape'),
+            'exchange_timeout': (0, httpx.ReadTimeout('private'), 'timeout'),
+            'exchange_transport': (0, httpx.ConnectError('private'), 'transport'),
+        }
 
         def browser(url):
             auth = urlsplit(url)
@@ -172,6 +183,13 @@ class Canary(unittest.IsolatedAsyncioTestCase):
             p = attempts[-1]
             if req.url.path.endswith('/token'):
                 form = dict(parse_qsl(req.content.decode()))
+                self.assertEqual(req.method, 'POST')
+                self.assertEqual(req.headers['content-type'], 'application/x-www-form-urlencoded')
+                self.assertEqual(set(form), {'grant_type', 'client_id', 'code', 'code_verifier', 'redirect_uri', 'resource'})
+                self.assertEqual((form['grant_type'], form['code']), ('authorization_code', 'test-code'))
+                self.assertEqual((p['resource'], p['code_challenge_method'], p['response_type']), (app.API, 'S256', 'code'))
+                self.assertTrue(form['code_verifier'] not in verifiers)
+                verifiers.add(form['code_verifier'])
                 self.assertEqual(form['redirect_uri'], p['redirect_uri'])
                 self.assertEqual(form['client_id'], 'oaiapp_test')
                 self.assertEqual(form['resource'], app.API)
@@ -179,6 +197,11 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                                  p['code_challenge'])
                 if mode == 'exchange_failure':
                     return httpx.Response(400)
+                if mode in exchanges:
+                    status, payload, _ = exchanges[mode]
+                    if isinstance(payload, Exception):
+                        raise payload
+                    return httpx.Response(status, headers={'content-type': 'application/json'}, stream=httpx.ByteStream(payload))
                 body = self.tokens(nonce=p['nonce'], sub='another' if mode == 'mismatch' else 'account')
             elif req.url.path.endswith('/jwks.json'):
                 body = self.keys
@@ -260,6 +283,8 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                                failed_private='response_failed', incomplete='response_incomplete', refusal='refusal',
                                reasoning='forbidden_item', unknown='forbidden_item', timeout='timeout', transport='transport')
                 for mode, count, result in [('exchange_failure', 1, 'stage=code_exchange; plan_use=not_attempted'),
+                                            *((m, 1, 'stage=code_exchange; plan_use=not_attempted; reason=' + r)
+                                              for m, (_, _, r) in exchanges.items()),
                                             ('success', 4, 'synthetic passed'),
                                             ('mismatch', 2, 'stage=identity_and_permissions; plan_use=not_attempted'),
                                             ('multiline', 4, 'synthetic passed'),
@@ -271,9 +296,12 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                     calls.clear()
                     executions = []
                     with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
-                        diagnostic = mode in ('catalog_only', 'forbidden')
+                        diagnostic = mode in exchanges or mode in ('catalog_only', 'forbidden')
                         rc = await asyncio.to_thread(app.main, ['--catalog-only' if diagnostic else '--run-synthetic'])
                     self.assertEqual(rc, 0 if mode in ('success', 'multiline', 'catalog_only') else 1)
+                    if mode in exchanges:
+                        self.assertEqual(out.getvalue().splitlines(), ['catalog not passed; ' + result])
+                        self.assertFalse(err.getvalue() or executions)
                     self.assertIn(result, out.getvalue())
                     if mode in reasons:
                         self.assertEqual(out.getvalue().splitlines(), ['preflight passed; no sign-in or plan use',
@@ -283,12 +311,19 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn('fake-bearer', out.getvalue())
                     self.assertEqual(calls, full[:count])
                     if mode == 'exchange_failure':
+                        self.assertEqual(executions, [b'17\n'])  # Preflight only.
                         self.assertFalse((root / 'registration.json').exists())
                         self.assertEqual((root / 'pending-client-id').read_text(), 'oaiapp_test')
             self.assertEqual(set(p.name for p in root.iterdir()), {'host-id', 'registration.json'})
             self.assertEqual(json.loads((root / 'registration.json').read_text()),
                              ['oaiapp_test', app.digest('account').hex()])
         first, second = attempts[:2]
+        for key in ('state', 'nonce', 'code_challenge'):
+            self.assertEqual(len({attempt[key] for attempt in attempts}), len(attempts))
+        for attempt in attempts[1:]:
+            self.assertTrue(attempt['client_id'] == 'oaiapp_test')
+            self.assertTrue(attempt['ext_agent_host_id'] == first['ext_agent_host_id'])
+            self.assertNotIn('agent_name_hint', attempt)
         self.assertEqual(first['client_id'], app.NEW)
         self.assertEqual(second['client_id'], 'oaiapp_test')
         self.assertNotIn('agent_name_hint', second)
