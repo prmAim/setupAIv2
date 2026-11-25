@@ -1,6 +1,6 @@
 import base64
 import asyncio
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -99,6 +99,21 @@ class Canary(unittest.IsolatedAsyncioTestCase):
 
     def test_sse_framing(self):
         raw = wire(stream())
+        for newline in (b'\n', b'\r\n', b'\r'):
+            framed = b'\xef\xbb\xbf\n' + raw.replace(b'data: ', b': heartbeat\nid: private\nretry: 15\ndata: ')
+            self.assertEqual(answer(framed.replace(b'\n', newline)), ANSWER)
+        for tail in (b'data: {', b'data: {}\n', b'event: private\n'):
+            with self.assertRaises(app.Rejected):
+                answer(raw + tail)
+        for pos in (1, 6, 7):
+            events = stream()
+            # Serialize first to avoid sharing nested fixture objects.
+            events = [json.loads(json.dumps(e)) for e in events]
+            msg = events[pos]['item'] if pos != 7 else events[pos]['response']['output'][0]
+            msg['phase'] = 'commentary'
+            with self.assertRaises(app.Rejected) as caught:
+                answer(wire(events))
+            self.assertEqual(caught.exception.reason, 'forbidden_item')
         self.assertEqual(answer(raw + b'data: [DONE]\n\n'), ANSWER)
         for tail in [b'null', b'[]', b'42', b'false', b'{}', b'[DONE]\n\ndata: [DONE]']:
             with self.assertRaises(ValueError):
@@ -180,6 +195,35 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(set(payload), {'model', 'input', 'store', 'stream'})
                     self.assertEqual((payload['model'], payload['store'], payload['stream']), ('test', False, True))
                     data = wire(stream()[:-1] if mode == 'interrupted' else stream())
+                    if mode in ('admission', 'unknown_code', 'oversize_error'):
+                        code = 'insufficient_quota' if mode == 'admission' else 'private'
+                        error = json.dumps(dict(error=dict(code=code, message='private'))).encode()
+                        return httpx.Response(429, headers={'content-type': 'application/json'}, stream=httpx.ByteStream(
+                            error if mode != 'oversize_error' else error.ljust(8193)))
+                    if mode in ('failed', 'failed_private', 'incomplete', 'refusal', 'reasoning', 'unknown'):
+                        e = stream()[1]
+                        if mode.startswith('failed'):
+                            e.update(type='response.failed', response=dict(error=dict(message='private',
+                                     code='server_error' if mode == 'failed' else 'private')))
+                        elif mode == 'incomplete':
+                            e.update(type='response.incomplete')
+                        elif mode == 'refusal':
+                            e.update(type='response.refusal.delta', delta='private')
+                        else:
+                            e['item']['type'] = mode
+                        data = wire([stream()[0], e])
+                    if mode == 'timeout':
+                        raise httpx.ReadTimeout('private')
+                    if mode == 'transport':
+                        raise httpx.ReadError('private')
+                    if mode == 'media':
+                        return httpx.Response(200, headers={'content-type': 'text/private'})
+                    if mode == 'size':
+                        data = data.ljust(262145)
+                    if mode == 'multiline':
+                        data = data.replace(b', "sequence_number"', b',\ndata: "sequence_number"')
+                    if mode == 'wrong':
+                        data = data.replace(b'print(42)', b'private')
                     return httpx.Response(200, headers={'content-type': 'text/event-stream'},
                                           stream=httpx.ByteStream(data))
             return httpx.Response(200, headers={'content-type': 'application/json'},
@@ -192,11 +236,12 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                 return original_client(transport=httpx.MockTransport(dispatch), **kwargs)
 
             def broker(data, expected):
+                executions.append(expected)
                 self.assertNotIn(mode, ('catalog_only', 'forbidden'))
                 if (data, expected) == (ANSWER, b'42\n'):
                     if mode == 'runner_failure':
                         return dict(status='failed', exit=1)
-                    self.assertEqual(mode, 'success')
+                    self.assertIn(mode, ('success', 'multiline'))
                 else:
                     self.assertEqual((data, expected), (b'print(17)\n', b'17\n'))
                 if os.environ.get('SETUPAI_TEST_LOCAL_BROKER') == '1':
@@ -209,19 +254,32 @@ class Canary(unittest.IsolatedAsyncioTestCase):
                   patch.object(app, 'canary', lambda _, *args: original_canary(root, *args)),
                   patch.object(app.sys.stdin, 'isatty', return_value=True), patch.object(app, 'broker', broker),
                   patch('builtins.input', return_value='Continue with ChatGPT')):
+                reasons = dict(interrupted='stream_interrupted', wrong='wrong_answer', size='size', media='media_type',
+                               admission='http_429; provider_code=insufficient_quota', unknown_code='http_429',
+                               oversize_error='http_429', failed='response_failed; provider_code=server_error',
+                               failed_private='response_failed', incomplete='response_incomplete', refusal='refusal',
+                               reasoning='forbidden_item', unknown='forbidden_item', timeout='timeout', transport='transport')
                 for mode, count, result in [('exchange_failure', 1, 'stage=code_exchange; plan_use=not_attempted'),
-                                            ('success', 4, 'synthetic passed ' + app.IMAGE),
+                                            ('success', 4, 'synthetic passed'),
                                             ('mismatch', 2, 'stage=identity_and_permissions; plan_use=not_attempted'),
-                                            ('interrupted', 4, 'stage=responses_post_attempted; plan_use=possible'),
+                                            ('multiline', 4, 'synthetic passed'),
+                                            *((m, 4, 'stage=responses_post_attempted; plan_use=possible; reason=' + r)
+                                              for m, r in reasons.items()),
                                             ('runner_failure', 4, 'stage=runner; plan_use=possible'),
                                             ('forbidden', 3, 'stage=catalog; plan_use=not_attempted; reason=http_403'),
                                             ('catalog_only', 3, 'catalog passed; plan_use=not_attempted')]:
                     calls.clear()
-                    with redirect_stdout(io.StringIO()) as out:
+                    executions = []
+                    with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
                         diagnostic = mode in ('catalog_only', 'forbidden')
                         rc = await asyncio.to_thread(app.main, ['--catalog-only' if diagnostic else '--run-synthetic'])
-                    self.assertEqual(rc, 0 if mode in ('success', 'catalog_only') else 1)
+                    self.assertEqual(rc, 0 if mode in ('success', 'multiline', 'catalog_only') else 1)
                     self.assertIn(result, out.getvalue())
+                    if mode in reasons:
+                        self.assertEqual(out.getvalue().splitlines(), ['preflight passed; no sign-in or plan use',
+                                                                       'synthetic not passed; ' + result])
+                        self.assertEqual(err.getvalue(), '')
+                        self.assertEqual(executions, [b'17\n'])  # Preflight only; never run rejected output.
                     self.assertNotIn('fake-bearer', out.getvalue())
                     self.assertEqual(calls, full[:count])
                     if mode == 'exchange_failure':

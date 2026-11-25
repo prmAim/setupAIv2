@@ -21,7 +21,7 @@ import httpx
 import jwt
 
 from tools.docker_gate import IMAGE, docker_gate
-from tools.siwc_stream import answer, require
+from tools.siwc_stream import HTTP_REASONS, Rejected, answer, require
 
 ISS = 'https://auth.openai.com'
 API = 'https://api.openai.com/v1'
@@ -30,16 +30,6 @@ NEW = 'dynamic_agent_client'
 CLIENT = r'oaiapp_[A-Za-z0-9_-]{1,200}'
 CALLBACK_SECONDS = 150
 CATALOG_LIMIT = 4 * 1024 * 1024
-HTTP_REASONS = {i: f'http_{i}' for i in range(100, 600)}
-REASONS = frozenset(HTTP_REASONS.values()) | {
-    'http_other', 'timeout', 'transport', 'media_type', 'encoding', 'size',
-    'invalid_json', 'malformed_shape', 'no_eligible',
-}
-
-
-class Rejected(ValueError):
-    def __init__(self, reason):
-        self.reason = reason if reason in REASONS else 'other'
 
 
 class Denied(ValueError):
@@ -117,19 +107,33 @@ async def authorize(host, client, browser):
                        code_verifier=verifier, redirect_uri=uri, resource=API)
 
 
+async def bounded(response, limit):
+    data = bytearray()
+    async for chunk in response.aiter_raw():
+        if len(data) + len(chunk) > limit:
+            raise Rejected('size')
+        data.extend(chunk)
+    return data
+
+
 async def request(http, method, url, mime='application/json', *, limit=256 * 1024, **kwargs):
     async with asyncio.timeout(45), http.stream(method, url, **kwargs) as response:
+        media = response.headers.get('content-type', '').split(';')[0].strip().lower()
+        encoding = response.headers.get('content-encoding', 'identity').strip().lower()
         if response.status_code != 200:
-            raise Rejected(HTTP_REASONS.get(response.status_code, 'http_other'))
-        if response.headers.get('content-type', '').split(';')[0].strip().lower() != mime:
+            error = None
+            if mime == 'text/event-stream' and media == 'application/json' and encoding == 'identity':
+                try:
+                    body = json.loads(await bounded(response, min(limit, 8192)))
+                    error = body.get('error') if isinstance(body, dict) else None
+                except (ValueError, RecursionError):
+                    pass  # An unreadable diagnostic must not hide the HTTP status.
+            raise Rejected(HTTP_REASONS.get(response.status_code, 'http_other'), error)
+        if media != mime:
             raise Rejected('media_type')
-        if response.headers.get('content-encoding', 'identity').strip().lower() != 'identity':
+        if encoding != 'identity':
             raise Rejected('encoding')
-        data = bytearray()
-        async for chunk in response.aiter_raw():
-            if len(data) + len(chunk) > limit:
-                raise Rejected('size')
-            data.extend(chunk)
+        data = await bounded(response, limit)
         if mime != 'application/json':
             return answer(data)
         try:
@@ -234,7 +238,7 @@ async def live(stage, catalog_only):
     stage('runner')
     proof = broker(data, b'42\n')
     require(proof and proof['status'] == 'passed')
-    print('synthetic passed', proof['inspected_image'], proof['container'])
+    print('synthetic passed')
     return 0
 
 
@@ -276,8 +280,17 @@ def main(args):
         return asyncio.run(live(stage, catalog_only))
     except (Exception, KeyboardInterrupt) as exc:
         reason = ''
-        if last == 'catalog':
-            reason = '; reason=' + (exc.reason if isinstance(exc, Rejected) else 'other')
+        if last in ('catalog', 'responses_post_attempted'):
+            if isinstance(exc, Rejected):
+                reason = '; reason=' + exc.reason
+                if exc.code:
+                    reason += '; provider_code=' + exc.code
+            elif isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+                reason = '; reason=timeout'
+            elif isinstance(exc, httpx.RequestError):
+                reason = '; reason=transport'
+            else:
+                reason = '; reason=other'
         mode = 'catalog' if catalog_only else 'synthetic'
         print(mode + ' not passed; stage=' + last + '; plan_use=' + ('possible' if possible else 'not_attempted') + reason)
         return 1

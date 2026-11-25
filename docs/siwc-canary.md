@@ -55,7 +55,7 @@ settings if needed. Tokens stay in process memory. No Codex files are consulted.
 - [Inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference.md) and [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations.md): one fixed `POST https://api.openai.com/v1/responses`, input array, no tools, `stream:true`, `store:false`, no redirects, continuation or unsupported `max_output_tokens`. The ceilings are **client-side**, not provider-side billing caps: 4 MiB for model discovery, 256 KiB for other HTTP responses, 10-second HTTPX timeouts and a 45-second total per operation. Unknown events (including separate reasoning items), tool calls, refusals, interruptions and mixed outputs cannot pass.
 - Only the nine bytes `print(42)` plus LF (ten bytes total) qualify as the complete contents of `answer.py`. No normalization or host execution. The Docker gate passes the validated bytes over stdin to the local, inspected, non-root Linux/amd64 image `sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89`, with a bounded `/tmp` tmpfs, no host bind mounts or volumes, no external network and no image pull. No image/runner is not a pass.
 
-**Success** is exit 0 **and** `synthetic passed <inspected-image> <container-id>`.
+**Success** is exit 0 **and** `synthetic passed`. Runner IDs are not printed.
 It requires a completed SSE message matching every text boundary and runner
 stdout exactly `42` plus LF. It proves only this synthetic trip through that
 account and model. A valid sign-in, HTTP 200, partial text, or fixture test alone
@@ -63,6 +63,34 @@ is not success and does not authorize a project or claim-to-draft run.
 Failure reports a fixed last stage, not provider text. `plan_use=not_attempted`
 means the Responses POST was not attempted; `plan_use=possible` means it was,
 even if the stream or runner later failed. Do not retry automatically.
+
+### Reading a Responses failure
+
+At `e472fad`, four offline fixtures produced the same `stage=responses_post_attempted; plan_use=possible`:
+HTTP 429 with a structured error, EOF before completion, valid multiline SSE carrying the exact answer,
+and a completed message with the wrong bytes. The multiline parser rejection was reproducible and is
+fixed. The old summary cannot identify which happened to an operator or establish whether usage was charged.
+
+There is no separate diagnostic flag. Only if you independently authorize a **new** plan request,
+use the `--run-synthetic` command above. Share only the final summary line, for example:
+
+```text
+synthetic not passed; stage=responses_post_attempted; plan_use=possible; reason=http_429; provider_code=insufficient_quota
+```
+
+| Reason | What was observed |
+| --- | --- |
+| `http_NNN` | Non-200 status. A bounded JSON error may add a known `provider_code`; absence is inconclusive. |
+| `timeout`, `transport` | The operation timed out or the HTTP transport failed. Neither establishes billing. |
+| `media_type`, `encoding`, `size` | The response did not meet client media, encoding or byte limits. |
+| `stream_interrupted`, `stream_invalid` | Missing completion/frame boundary, or an invalid/unexpected event, shape or sequence. |
+| `response_failed`, `response_incomplete`, `refusal`, `forbidden_item` | The provider reported failure (possibly with a known code), incomplete output, refusal, or an item outside the single final text contract. |
+| `wrong_answer` | All required boundaries agreed on the text, but its bytes were not the reviewed answer. |
+| `other` | No more specific safe category. |
+
+Comments, multiline `data:`, framing metadata, UTF-8 BOM and standard SSE line endings do not
+change the answer bytes. Explicit commentary is not final text. No rejected output goes to Docker.
+Do not share bodies, headers, exception text, IDs, registration files, browser URLs or logs.
 
 [Eligibility](https://developers.openai.com/siwc/quickstart.md): the local OSS
 preview is for eligible Plus/Pro users; workspace policy, granted plan access,
