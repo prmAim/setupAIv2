@@ -1,0 +1,47 @@
+# One synthetic Sign in with ChatGPT request
+
+This standalone canary does not select a project, invoke Codex, or publish a change.
+Only run it from the trusted, reviewed worktree, on your own desktop with a system
+browser, a private home directory and trusted local Docker installation. Do not
+run it under a debugger, HTTP recorder or instrumented Python installation.
+
+From the worktree root, install the locked environment with `uv sync --locked`.
+`uv run --offline --locked python -m tools.siwc_canary` just prints `not_run`.
+After review, the **owner only** can start the live experiment with:
+
+```powershell
+uv run --offline --locked python -m tools.siwc_canary --run-synthetic
+```
+
+`--offline` applies to uv, not the canary. Confirm the terminal prompt only if
+you authorize one request against your ChatGPT plan, using the first visible
+model in your account catalog. Use the system browser to choose the account and
+authorize the app; never paste a code or token into the terminal. There are no
+automatic retries, account switching, refreshes, API keys or paid-key fallback.
+
+On confirmation the app creates `~/.setupai-siwc-canary/host-id` (stable UUIDv4
+URN). After validating the token and permissions it saves `registration.json`
+(issued client ID and SHA-256 of verified subject, **not** a token). These files
+are local to one installation/account; do not sync them or copy to another
+host. Preserve the host ID across sign-ins. Removing only `registration.json`
+forgets the local registration, not the server grant. Revoke access in ChatGPT
+settings if needed. Tokens stay in process memory. No Codex files are consulted.
+
+## What is being tested
+
+- [Registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in.md): initial dynamic registration, then the issued client and same host on return. Each attempt uses fresh PKCE S256, state, nonce and `http://127.0.0.1:<port>/auth/callback`. Returning sign-in may show an account selector **without** a new provider consent screen. The terminal opt-in is required each time.
+- [Signature validation](https://developers.openai.com/siwc/website.md): PyJWT verifies RS256 using the pinned production JWKS, issuer, issued-client audience, expiry and attempt nonce before using the access token. This single-shot subset requests `openid resource.invoke chatgpt.tokens.use.direct`, not optional profile/email or refresh access. Acceptance of the minimal scope set is not live-verified; denial stops the run, never widens permissions.
+- [Inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference.md) and [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations.md): one fixed `POST https://api.openai.com/v1/responses`, input array, no tools, `stream:true`, `store:false`, no redirects, continuation or unsupported `max_output_tokens`. The ceiling is **client-side**, not a provider-side billing cap: 256 KiB and 45 seconds per HTTP operation. Unknown events (including separate reasoning items), tool calls, refusals, interruptions and mixed outputs cannot pass.
+- Only the nine bytes `print(42)` plus LF (ten bytes total) qualify as the complete contents of `answer.py`. No normalization or host execution. The Docker gate passes the validated bytes over stdin to the local, inspected, non-root Linux/amd64 image `sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89`, with no mounts, external network or image pull. No image/runner is not a pass.
+
+**Success** is exit 0 **and** `synthetic passed <inspected-image> <container-id>`.
+It requires a completed SSE message matching every text boundary and runner
+stdout exactly `42` plus LF. It proves only this synthetic trip through that
+account and model. A valid sign-in, HTTP 200, partial text, or fixture test alone
+is not success and does not authorize a project or claim-to-draft run.
+
+[Eligibility](https://developers.openai.com/siwc/quickstart.md): the local OSS
+preview is for eligible Plus/Pro users; workspace policy, granted plan access,
+catalog and quota can still prevent inference. Do not assume a commercial or
+remote deployment qualifies. The public contract and offline fixtures were
+checked, not live registration, model behavior, or account eligibility.
