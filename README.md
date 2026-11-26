@@ -113,6 +113,7 @@ uv add langgraph langchain langchain-openai pydantic pydantic-settings langfuse
 
 ## Документация
 
+- [DeerFlow v2.2.0: Fortune и Orbita — вход, запуск, остановка и ограничения](infra/deerflow/README.md)
 - [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview)
 - [LangChain](https://docs.langchain.com/oss/python/langchain/install)
 - [Pydantic](https://docs.pydantic.dev/latest/)
