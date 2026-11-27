@@ -1,9 +1,20 @@
 # setupAIv2
 
+Автономный агент разработки: от очереди GitHub Issues до проверенных изменений,
+слияния в `main` и перехода к следующей задаче.
+**[Главная цель и полный цикл работы](CONTEXT.md)** — основной ориентир проекта.
+
+Выбранная исполнительная платформа — **DeerFlow Runtime Harness** для Fortune
+и Orbita. Причины и границы решения: [ADR-0001](docs/adr/0001-deerflow-runtime.md).
+
+Продолжение разработки: [план автономного цикла](docs/plans/deerflow-autonomous-cycle.md).
+
 Исследование интеграции: [готовые пути Codex + DeerFlow и предложение упрощения](docs/validation/codex-deerflow-integration-research-20261127.md)
 — сравнение на 27.11.2026, офлайн-доказательства и границы будущей живой проверки.
 
 Подготовленная интеграция: [CodexChatModel, refresh и отмена — офлайн-проверки](docs/validation/deerflow-codex-integration-20261127.md).
+
+## Текущее окружение
 
 Python-окружение для LangGraph, LangChain, Pydantic и локального Langfuse.
 Модель для первых проверок — OpenAI `gpt-6-luna` через Responses API.

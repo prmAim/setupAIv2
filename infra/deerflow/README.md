@@ -131,6 +131,39 @@ HTTP health и эти проверки не являются аудитом бе
 
 ## Восстановление установки на этом ПК
 
+### Офлайн-проверка checkpoint полного цикла
+
+`tools/deerflow_cycle_state.py` задаёт payload прогресса для embedded Harness.
+Он передаётся как `state_schema=CycleState` в `create_deerflow_agent` с режимом
+`full`. Это данные прогресса, не разрешение выполнять действия. Перед реальным
+продолжением контроллер должен подтвердить claim под общей блокировкой исполнения,
+политику и фактические эффекты GitHub. Gateway пока эту схему не подключает.
+
+Проверка использует закреплённый backend, SQLite и синтетическую модель без
+инструментов. В контейнер передаётся только каталог инструментов, без `.env`,
+OAuth, рабочих данных Gateway и Docker socket:
+
+```powershell
+$image = (Get-Content infra/deerflow/images.json | ConvertFrom-Json).backend
+docker run --rm --pull never --network none --read-only --cap-drop ALL `
+  --security-opt no-new-privileges --pids-limit 128 --memory 1g `
+  --tmpfs /tmp:rw,noexec,nosuid,size=256m `
+  --mount "type=bind,source=$((Resolve-Path tools).Path),target=/probe/tools,readonly" `
+  --workdir /probe --entrypoint /app/backend/.venv/bin/python `
+  $image -B -m tools.verify_deerflow_resume
+```
+
+Ожидаются exit 0 и JSON `status=passed`. Внутри запускаются шесть процессов:
+для двух проектов пауза с аварийным выходом 73, resume с выходом 74 после
+terminal checkpoint, затем readback без нового вызова модели. Хранилища
+раздельные, thread ID одинаковый для проверки отсутствия смешения состояния.
+Временные базы удаляются при завершении. Эта проверка не вызывает подписку,
+не принимает live-пилот, не проверяет восстановление push/PR и не заменяет
+перезапуск Gateway. Подробности — в
+[отчёте продолжения](../../docs/validation/deerflow-autonomous-cycle-20261127.md).
+
+### Подготовка и запуск
+
 Сохранить upstream в `.scratch/deerflow/upstream` на указанном commit. Скрипт
 `prepare` проверяет SHA. Он генерирует конфигурацию и Compose, не запускает сервисы:
 
