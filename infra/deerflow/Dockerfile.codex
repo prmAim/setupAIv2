@@ -1,0 +1,6 @@
+FROM ghcr.io/bytedance/deer-flow-backend@sha256:0eff3cb395700c5bfee09a6bc57f878dcdc6232591f2210896e5fe5fdf9c145b
+COPY codex.tar.gz /tmp/codex.tar.gz
+COPY vendor /opt/setupaiv2-vendor
+COPY runtime /opt/setupaiv2-runtime
+RUN /app/backend/.venv/bin/python /opt/setupaiv2-vendor/install.py
+ENV PYTHONPATH=/opt/setupaiv2-runtime

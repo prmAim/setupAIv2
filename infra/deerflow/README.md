@@ -1,5 +1,9 @@
 # DeerFlow для Fortune и Orbita
 
+Подготовка перехода на встроенный CodexChatModel без живого запуска:
+[отдельный кандидат, обновление авторизации и отмена запросов](CODEX.md).
+Ниже описана существующая установка; она этим переходом пока не заменена.
+
 Общая установка DeerFlow **v2.2.0**, commit
 `58fc5bd5b8e6ea46538e9481ba06ca2a46e14e2a`, на Docker Desktop **WSL 2**.
 Образы backend, frontend и nginx закреплены по digest в `images.json`.

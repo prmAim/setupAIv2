@@ -14,6 +14,37 @@ SPEC.loader.exec_module(platform)
 
 
 class PlatformTests(unittest.TestCase):
+    def test_codex_candidate_has_no_api_key_dependency_or_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "runtime"
+            upstream = root / "upstream"
+            home.mkdir()
+            (upstream / "docker/nginx").mkdir(parents=True)
+            (upstream / "docker/nginx/nginx.conf").write_text("gateway:8001 frontend:3000")
+            (root / "infra/deerflow").mkdir(parents=True)
+            images = {"commit": "test", "backend": "backend@sha256:test", "frontend": "frontend@sha256:test", "nginx": "nginx@sha256:test"}
+            (root / "infra/deerflow/images.json").write_text(json.dumps(images))
+            (home / "image.json").write_text(json.dumps({"base": images["backend"], "image": "sha256:candidate"}))
+            compose = home / "compose.json"
+            with patch.multiple(platform, ROOT=root, HOME=home, UPSTREAM=upstream, COMPOSE=compose), patch.object(platform.subprocess, "check_output", return_value="test"), patch.object(platform, "snapshot", return_value="baseline"), patch.object(platform, "dotenv_values", side_effect=AssertionError("Must not read API credentials")):
+                platform.prepare(codex=True, model="fixture-model")
+            cfg = json.loads(compose.read_text())
+            self.assertEqual(cfg["name"], "deerflow-codex")
+            self.assertEqual(set(cfg["volumes"]), {"fortune-codex-auth", "orbita-codex-auth"})
+            for project in ("fortune", "orbita"):
+                env = (home / project / ".env").read_text()
+                self.assertNotIn("OPENAI_API_KEY", env)
+                gateway = cfg["services"][f"{project}-gateway"]
+                self.assertEqual(gateway["image"], "sha256:candidate")
+                self.assertEqual(gateway["environment"]["CODEX_HOME"], "/run/codex")
+                self.assertIn(f"{project}-codex-auth:/run/codex", gateway["volumes"])
+                config = json.loads((home / project / "config.json").read_text())
+                self.assertEqual(len(config["models"]), 1)
+                self.assertEqual(config["models"][0]["model"], "fixture-model")
+                self.assertEqual(config["llm_call"]["retry_max_attempts"], 1)
+                self.assertFalse(config["sandbox"]["allow_host_bash"])
+
     def test_snapshot_excludes_credentials_and_preserves_agent_changes(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
