@@ -63,13 +63,20 @@ def snapshot(repo: Path, target: Path) -> str:
     return revision
 
 
-def prepare() -> None:
+def prepare(*, codex: bool = False, model: str | None = None) -> None:
     images = json.loads((ROOT / "infra/deerflow/images.json").read_text())
     revision = subprocess.check_output(["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"], text=True).strip()
     if revision != images["commit"]:
         raise RuntimeError("Upstream checkout does not match pinned release")
-    base_env = dotenv_values(ROOT / ".env")
-    if not base_env.get("OPENAI_API_KEY"):
+    if codex:
+        if not model or not model.strip():
+            raise RuntimeError("Codex preparation requires an explicit --model; availability is not inferred")
+        candidate = json.loads((HOME / "image.json").read_text())
+        if candidate.get("base") != images["backend"] or not candidate.get("image", "").startswith("sha256:"):
+            raise RuntimeError("Build the pinned Codex candidate image first")
+        images["backend"] = candidate["image"]
+    base_env = {} if codex else dotenv_values(ROOT / ".env")
+    if not codex and not base_env.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is missing from the existing local configuration")
     shared = HOME / "shared-skills"
     (shared / "public").mkdir(parents=True, exist_ok=True)
@@ -89,11 +96,13 @@ def prepare() -> None:
         if len(private["encryption"]) == 43:
             private["encryption"] += "="
             write_json(credentials, private)
-        project_env = dotenv_values(repo / ".env")
-        env = {"OPENAI_API_KEY": base_env["OPENAI_API_KEY"], "AUTH_JWT_SECRET": private["jwt"],
+        project_env = {} if codex else dotenv_values(repo / ".env")
+        env = {"AUTH_JWT_SECRET": private["jwt"],
                "DEER_FLOW_CREDENTIALS_KEY": private["encryption"],
                "DEER_FLOW_INTERNAL_AUTH_TOKEN": private["internal"], "LANGSMITH_TRACING": "false",
                "LANGFUSE_TRACING": "false", "LANGFUSE_BASE_URL": "http://host.docker.internal:3000"}
+        if not codex:
+            env["OPENAI_API_KEY"] = base_env["OPENAI_API_KEY"]
         for key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"):
             if project_env.get(key):
                 env[key] = project_env[key]
@@ -119,6 +128,11 @@ def prepare() -> None:
                        "use": f"deerflow.sandbox.tools:{n}_tool"} for n in ["ls", "read_file", "glob", "grep", "write_file", "str_replace"]],
             "lead_prompt_overlay": {"prepend": f"You work only on {project}. The project snapshot is /mnt/project, baseline {source_revision}. Read its AGENTS.md before work. Changes stay in this snapshot; never claim the original repository was modified. Shell execution and external publishing are unavailable. Answer the owner in Russian."},
         }
+        if codex:
+            config["models"] = [{"name": "codex", "use": "setupaiv2_deerflow.codex:ManagedCodexChatModel",
+                                 "model": model, "retry_max_attempts": 1,
+                                 "supports_thinking": True, "supports_reasoning_effort": True}]
+            config["llm_call"] = {"retry_max_attempts": 1}
         write_json(local / "config.json", config)
         if not (local / "extensions.json").exists():
             write_json(local / "extensions.json", {"mcp_servers": {}, "skills": {}})
@@ -136,13 +150,23 @@ def prepare() -> None:
                         f"{local.as_posix()}/data:/data", f"{local.as_posix()}/workspace:/workspace", f"{shared.as_posix()}:/shared-skills:ro"],
             "extra_hosts": ["host.docker.internal:host-gateway"],
             "healthcheck": {"test": ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health/ready',timeout=5)"], "interval": "10s", "timeout": "6s", "retries": 18, "start_period": "30s"}}
+        if codex:
+            # Dedicated empty auth volume; never import the owner's .codex.
+            # A named Linux volume preserves private permissions and atomic
+            # replacement by Codex, unlike a single-file read-only bind mount.
+            gateway = services[f"{project}-gateway"]
+            gateway["environment"]["CODEX_HOME"] = "/run/codex"
+            gateway["volumes"].append(f"{project}-codex-auth:/run/codex")
         services[f"{project}-frontend"] = common | {"image": images["frontend"], "environment": {
             "BETTER_AUTH_SECRET": private["frontend"], "DEER_FLOW_INTERNAL_GATEWAY_BASE_URL": f"http://{project}-gateway:8001"}}
         services[f"{project}-nginx"] = common | {"image": images["nginx"], "ports": [f"127.0.0.1:{port}:2026"],
             "volumes": [f"{local.as_posix()}/nginx.conf:/etc/nginx/nginx.conf:ro"],
             "depends_on": {f"{project}-gateway": {"condition": "service_healthy"}, f"{project}-frontend": {"condition": "service_started"}}}
         networks[project] = {}
-    write_json(COMPOSE, {"name": "deerflow-platform", "services": services, "networks": networks})
+    compose = {"name": "deerflow-codex" if codex else "deerflow-platform", "services": services, "networks": networks}
+    if codex:
+        compose["volumes"] = {f"{p}-codex-auth": {} for p in PROJECTS}
+    write_json(COMPOSE, compose)
     print("Prepared pinned DeerFlow profiles: Fortune :2026, Orbita :2027. Credentials remain local.")
 
 
@@ -169,6 +193,7 @@ class LocalSession:
 def initialize() -> None:
     """Initialize only our new runtimes; never reset existing accounts."""
     for project, (_, port) in PROJECTS.items():
+        model_name = json.loads((HOME / project / "config.json").read_text())["models"][0]["name"]
         private = json.loads((HOME / project / "credentials.json").read_text())
         session = LocalSession(port)
         status = session.request("/api/v1/auth/setup-status")
@@ -182,18 +207,24 @@ def initialize() -> None:
         name = f"{project}-developer"
         if not any(agent["name"] == name for agent in agents):
             session.request("/api/agents", {"name": name, "display_name": f"{project.title()} Developer",
-                            "description": f"Isolated {project} development workspace", "model": "gpt-6-luna",
+                            "description": f"Isolated {project} development workspace", "model": model_name,
                             "tool_groups": ["file:read", "file:write"], "mcp_plugins": [], "skills": [],
                             "soul": f"Work only on {project} in /mnt/project. Read AGENTS.md. Respond in Russian. Changes are proposals in a snapshot, never direct changes to the original repository."})
         print(f"PASS: {project} authentication and agent {name}")
 
 
 def main() -> None:
+    global HOME, COMPOSE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["prepare", "start", "stop", "status", "initialize"])
+    parser.add_argument("--profile", choices=["api", "codex"], default="api")
+    parser.add_argument("--model", help="Explicit model for Codex preparation; no catalog or inference call")
     args = parser.parse_args()
+    if args.profile == "codex":
+        HOME = ROOT / ".scratch/deerflow-codex"
+        COMPOSE = HOME / "compose.json"
     if args.action == "prepare":
-        prepare()
+        prepare(codex=args.profile == "codex", model=args.model)
         return
     if args.action == "initialize":
         initialize()
