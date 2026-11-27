@@ -54,6 +54,7 @@ class Remote:
         return comment
 
 
+@unittest.skipUnless(os.name == 'posix', 'Claim writer requires Linux flock and directory fsync')
 class Claim(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
