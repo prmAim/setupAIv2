@@ -18,6 +18,17 @@ del _Selection
 RUN = 'a' * 32
 USER = {'type': 'User', 'id': 123}
 
+# Operator fixture pins; never taken from the runner response.
+PROJECT = ('d' * 40, (('-m', 'unittest', 'tests.check'),), (('tests/check.py', 'e' * 64),))
+STAGED = 'f' * 40
+
+
+def passed(p, edit):
+    from hashlib import sha256
+    return dict(status='passed', exit=0, duration_ms=1, image=p.image, inspected_image=p.image,
+                container='2' * 64, baseline=p.project_tree, protected=dict(p.protected), tree=STAGED,
+                commands=list(map(list, p.commands)), edit_sha256=sha256(edit).hexdigest())
+
 
 class Remote:
     def __init__(self, root):
@@ -75,11 +86,248 @@ class Claim(unittest.TestCase):
         self.assertEqual(len(self.remote.log()), 1)
         self.assertIn(RUN, json.loads(self.remote.log()[0])['body'])
 
+    def test_verified_execution_keeps_guard_until_effects_finish(self):
+        import fcntl
+        from tools.claim_issue import run_profile
+
+        calls = []
+        def execute(claim, task, recheck):
+            calls.append(claim['claim_id'])
+            fd = os.open(self.state, os.O_DIRECTORY)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            return dict(status='not_run', **claim)
+
+        def resume():
+            return run_profile('example', RUN, resume=True, profile=PROFILE,
+                               github=self.remote.read, post=self.remote.post, approved_repo='owner/project',
+                               owner=123, state=self.state, execute=execute, authenticate=lambda: USER)
+
+        self.assertEqual(self.invoke()['status'], 'claimed')
+        self.assertEqual(resume()['status'], 'not_run')
+        self.remote.issue['state'] = 'closed'
+        self.assertEqual(resume()['status'], 'diagnostic')
+        self.assertEqual(calls, [42])
+
     def test_selection_pin_alone_never_authorizes_a_live_claim(self):
         from tools.claim_issue import command
         with patch.object(Path, 'read_text', side_effect=FileNotFoundError), patch('subprocess.run') as gh:
             self.assertEqual(command(['example', RUN])['status'], 'diagnostic')
             gh.assert_not_called()
+
+    def test_container_with_unknown_or_different_image_is_removed_without_start(self):
+        from tools.docker_gate import isolated, IMAGE
+        cid = 'a' * 64
+        spec = dict(Id=cid, Platform='linux', Mounts=[], Config=dict(Image=IMAGE, User='65534:65534'),
+                    HostConfig=dict(Privileged=False, NetworkMode='none', ReadonlyRootfs=True,
+                                    CapAdd=[], Devices=[], PidMode='', CapDrop=['ALL']))
+        for inspected in (spec, spec | dict(Image='sha256:' + 'b' * 64)):
+            with patch('subprocess.run') as control, patch('subprocess.Popen') as start:
+                replies = [json.dumps(['name=seccomp,profile=builtin']).encode(), cid.encode(),
+                           json.dumps([inspected]).encode(), b'']
+                control.side_effect = [subprocess.CompletedProcess([], 0, raw) for raw in replies]
+                self.assertIsNone(isolated(Path('/bin/docker'), '', b'', b''))
+                start.assert_not_called()
+                self.assertEqual(control.call_args.args[0][-3:-1], ['rm', '-f'])
+
+    def test_optimized_native_probe_refuses_before_docker(self):
+        script = Path(__file__).resolve().parents[1] / 'tools' / 'prove_draft_runner.py'
+        result = subprocess.run([sys.executable, '-I', '-O', '-B', str(script)], capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'without -O', result.stderr)
+        self.assertEqual(result.stdout, b'')
+
+    def test_profile_executes_only_allowlisted_edit_and_reconciles_draft(self):
+        from tools.claim_issue import run_profile
+        from tools.draft import Draft, Profile
+        from hashlib import sha256
+
+        source = b'print(1)'
+        (self.root / 'solution.py').write_bytes(source)
+        (self.root / 'private').write_text('PRIVATE-MARKER')
+        image = 'sha256:' + '1' * 64
+        base, head = 'b' * 40, 'c' * 40
+        policy = Profile('owner/project', 'main', base, 'solution.py', sha256(source).hexdigest(),
+                         image, b'', b'2\n', *PROJECT)
+        effects = []
+        class Interrupted(BaseException):
+            pass
+        class Publisher:
+            branch = pr = None
+            parent = '9' * 40
+            commit_tree = STAGED
+            commit_head = head
+            def commit(_, repo, sha):
+                self.assertEqual(sha, head)
+                return dict(sha=_.commit_head, parents=[dict(sha=_.parent)], tree=dict(sha=_.commit_tree))
+            def prepare(_, claim, profile, data, *, tested_tree):
+                self.assertEqual(tested_tree, STAGED)
+                self.assertEqual(data, b'print(2)')
+                return head
+            def ref(_, repo, branch):
+                return base if branch == 'main' else _.branch
+            def create_ref(_, repo, branch, sha):
+                effects.append('ref'); _.branch = sha
+                raise Interrupted
+            def drafts(_, repo, branch):
+                return [_.pr] if _.pr else []
+            def create_draft(_, repo, branch, target, number):
+                effects.append('draft')
+                _.pr = dict(repo=repo, base_repo=repo, branch=branch, base=target, head=head,
+                            state='open', draft=True, number=7)
+                raise Interrupted
+        def propose(snapshot, task):
+            self.assertEqual(snapshot, {'solution.py': source})
+            return {'solution.py': b'print(2)'}
+        def gate(policy, data):
+            return passed(policy, data)
+        pub = Publisher()
+        original_ref = pub.ref
+        def invoke(model, runner):
+            return run_profile('example', RUN, resume=True, profile=PROFILE, github=self.remote.read,
+                               post=self.remote.post, approved_repo=policy.repo, owner=123, state=self.state,
+                               execute=Draft(policy, self.root, model, runner, pub, self.root / 'draft.sqlite'), authenticate=lambda: USER)
+        self.assertEqual(self.invoke()['status'], 'claimed')
+        self.assertEqual(invoke(lambda *_: {'private': b'edit'}, gate)['status'], 'invalid_edit')
+        self.assertEqual(invoke(propose, lambda *_: None)['status'], 'not_run')
+        self.assertEqual(effects, [])
+        self.assertEqual(invoke(propose, gate)['status'], 'invalid_evidence')
+        self.assertEqual(effects, [])
+        pub.parent = base
+        for attr in ('commit_head', 'commit_tree'):
+            good = getattr(pub, attr)
+            setattr(pub, attr, '8' * 40)
+            self.assertEqual(invoke(propose, gate)['status'], 'invalid_evidence')
+            self.assertEqual(effects, [])
+            setattr(pub, attr, good)
+        def revoked(repo, branch):
+            if branch != 'main':
+                self.remote.issue['state'] = 'closed'
+            return original_ref(repo, branch)
+        pub.ref = revoked
+        self.assertEqual(invoke(propose, gate)['status'], 'diagnostic')
+        self.assertEqual(effects, [])
+        self.remote.issue['state'] = 'open'
+        pub.ref = original_ref
+        # Revoke during the last readback, after recovery has validated the saved head.
+        read_commit = pub.commit
+        reads = []
+        def revoke_on_second_read(repo, sha):
+            reads.append(sha)
+            if len(reads) == 2:
+                self.remote.issue['state'] = 'closed'
+            return read_commit(repo, sha)
+        pub.commit = revoke_on_second_read
+        self.assertEqual(invoke(propose, gate)['status'], 'diagnostic')
+        self.assertEqual(reads, [head, head])
+        self.assertEqual(effects, [])
+        pub.commit = read_commit
+        self.remote.issue['state'] = 'open'
+        with self.assertRaises(Interrupted):
+            invoke(propose, gate)
+        def already_proposed(*_):
+            self.fail('resume discarded the checked candidate')
+        pub.ref = revoked
+        self.assertEqual(invoke(already_proposed, gate)['status'], 'diagnostic')
+        self.assertEqual(effects, ['ref'])
+        pub.commit_tree = '8' * 40
+        self.remote.issue['state'] = 'open'
+        pub.ref = original_ref
+        self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
+        self.assertEqual(effects, ['ref'])
+        pub.commit_tree = STAGED
+        with self.assertRaises(Interrupted):
+            invoke(already_proposed, gate)
+        for _ in range(2):
+            report = invoke(already_proposed, lambda *_: self.fail('runner required after publication'))
+            self.assertEqual(report['status'], 'draft')
+            self.assertEqual(report['head'], head)
+            self.assertEqual(report['pr'], 'https://github.com/owner/project/pull/7')
+            self.assertNotIn('PRIVATE-MARKER', repr(report))
+        self.assertEqual(effects, ['ref', 'draft'])
+        pub.parent = '9' * 40
+        self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
+        pub.parent = base
+        import sqlite3
+        with sqlite3.connect(self.root / 'draft.sqlite') as journal:
+            saved, = journal.execute('SELECT evidence FROM proof').fetchone()
+            for key, wrong in [('inspected_image', 'sha256:' + '8' * 64), ('protected', {}),
+                               ('baseline', '8' * 40), ('tree', '8' * 40), ('legacy', True)]:
+                broken = json.loads(saved)
+                broken[key] = wrong
+                journal.execute('UPDATE proof SET evidence=?', (json.dumps(broken),))
+                journal.commit()
+                self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
+            del broken['legacy'], broken['inspected_image']
+            journal.execute('UPDATE proof SET evidence=?', (json.dumps(broken),))
+            journal.commit()
+            self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
+            for invalid in ('{', None, json.dumps(json.loads(saved) | {'tree': None}),
+                            json.dumps(json.loads(saved) | {'status': 'failed'})):
+                journal.execute('UPDATE proof SET evidence=?', (invalid,))
+                journal.commit()
+                self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
+            journal.execute('UPDATE proof SET evidence=?', (saved,))
+        pub.pr['number'] = 8
+        self.assertEqual(invoke(propose, gate)['status'], 'remote_conflict')
+        pub.pr['number'] = 7
+        pub.pr['draft'] = False
+        self.assertEqual(invoke(propose, gate)['status'], 'remote_conflict')
+        pub.pr = None  # An absent read after an attempted write is not permission to replay.
+        self.assertEqual(invoke(propose, gate)['status'], 'write_unconfirmed')
+        self.assertEqual(effects, ['ref', 'draft'])
+        with sqlite3.connect(self.root / 'draft.sqlite') as journal:
+            journal.execute('UPDATE candidate SET data=?', (b'other candidate',))
+        self.assertEqual(invoke(already_proposed, gate)['status'], 'invalid_evidence')
+        self.assertEqual(effects, ['ref', 'draft'])
+
+    def test_installed_adapters_keep_role_credentials_out_of_profile_data(self):
+        from hashlib import sha256
+        from tools.claim_issue import run_profile
+        from tools.draft import Draft, Profile
+        from tools.claim_issue import command
+        from tools.draft import AdapterFailure
+        from tools.draft_github import GitHubDrafts
+        source = b'print(1)'
+        (self.root / 'a.py').write_bytes(source)
+        p = Profile('owner/project', 'main', 'a' * 40, 'a.py', sha256(source).hexdigest(),
+                    'sha256:' + '1' * 64, b'', b'2\n', *PROJECT)
+        evidence = passed(p, b'print(2)')
+        workflow = Draft(p, self.root, lambda *_: {'a.py': b'print(2)'}, lambda *_: evidence,
+                         GitHubDrafts(p, self.root, 'publisher-only'), self.root / 'candidate.db')
+        self.assertEqual(self.invoke()['status'], 'claimed')
+        def invoke():
+            return run_profile('example', RUN, resume=True, profile=PROFILE, github=self.remote.read,
+                               post=self.remote.post, approved_repo=p.repo, owner=123, state=self.state, execute=workflow,
+                               authenticate=lambda: USER)
+        with (patch.dict(os.environ, {'TokenGitHub': 'private-marker'}),
+              patch('http.client.HTTPSConnection') as conn, patch('subprocess.run') as gh):
+            self.assertEqual(command(['example', RUN, '--draft'])['status'], 'not_run')
+            conn.assert_not_called()
+            model = workflow.propose
+            for failure in ('auth_expired', 'quota_exhausted', 'network_blocked'):
+                def unavailable(*_):
+                    raise AdapterFailure(failure)
+                workflow.propose = unavailable
+                self.assertEqual(invoke()['status'], failure)
+                gh.assert_not_called()
+            workflow.propose = model
+            gh.side_effect = subprocess.TimeoutExpired('gh', 30)
+            self.assertEqual(invoke()['status'], 'network_blocked')
+            gh.reset_mock(side_effect=True)
+            gh.return_value = subprocess.CompletedProcess([], 0, b'[]')
+            self.assertEqual(invoke()['status'], 'remote_conflict')  # base ref absent: no writes
+            conn.assert_not_called()
+            gh.assert_called_once()
+            args, opts = gh.call_args
+            self.assertEqual(args[0], ['/usr/bin/gh', 'api', '--hostname', 'github.com', '--method', 'GET',
+                                       'repos/owner/project/git/matching-refs/heads/main'])
+            self.assertEqual(opts['env']['GH_TOKEN'], 'publisher-only')
+            self.assertNotIn('TokenGitHub', opts['env'])
+            self.assertNotIn('model-only', repr(opts))
 
     def test_incomplete_or_changing_comment_pages_block_write_and_recovery(self):
         original = self.remote.read

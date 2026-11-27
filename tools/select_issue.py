@@ -25,7 +25,8 @@ REPOSITORY = re.compile(r'[A-Za-z0-9_-]+/[A-Za-z0-9_-][A-Za-z0-9_.-]*')
 
 def gh(args):
     binary = 'C:/Program Files/GitHub CLI/gh.exe' if os.name == 'nt' else '/usr/bin/gh'
-    env = os.environ | {'GH_NO_UPDATE_NOTIFIER': '1', 'GH_PROMPT_DISABLED': '1'}
+    env = {k: os.environ[k] for k in ('GH_CONFIG_DIR', 'GH_TOKEN', 'GITHUB_TOKEN', 'HOME', 'APPDATA', 'SystemRoot') if k in os.environ}
+    env.update(GH_NO_UPDATE_NOTIFIER='1', GH_PROMPT_DISABLED='1')
     operation = 'GitHub timeline query' if args[0] == 'graphql' else 'GitHub GET'
     try:
         output = subprocess.run([binary, 'api', '--hostname', 'github.com', *args], env=env,
@@ -46,7 +47,7 @@ def pages(github, path):
     return [row for page in result for row in page]
 
 
-def verified_history(github, repo, number, label_id, trusted):
+def verified_history(github, repo, number, label_id, trusted, own_ref=None):
     owner, name = repo.split('/')
     query = Path(__file__).with_name('issue_timeline.graphql').read_text(encoding='utf-8')
     replies = github(['graphql', '--paginate', '--slurp', '-f', 'query=' + query,
@@ -65,6 +66,12 @@ def verified_history(github, repo, number, label_id, trusted):
             count = issue[field]['totalCount']
             if type(count) is not int or count < 0:
                 raise Diagnostic('unreadable work links')
+            if field == 'linkedBranches' and count == 1 and own_ref is not None:
+                nodes = issue[field]['nodes']
+                if len(nodes) == 1:
+                    ref = nodes[0]['ref']
+                    if ref and (ref['repository']['nameWithOwner'], ref['name'], ref['target']['oid']) == own_ref:
+                        continue
             active |= count > 0
         items = issue['timelineItems']
         info = items['pageInfo']
@@ -113,7 +120,7 @@ def issue_state(row):
     return row['state']
 
 
-def eligible(github, repo, issue, trusted, *, verify_claim=None, read_comments=pages):
+def eligible(github, repo, issue, trusted, *, verify_claim=None, read_comments=pages, own_ref=None):
     ready = 'ready-for-agent'
     if 'pull_request' in issue or issue_state(issue) != 'open':
         return False
@@ -134,7 +141,7 @@ def eligible(github, repo, issue, trusted, *, verify_claim=None, read_comments=p
     ids = [label['node_id'] for label in issue['labels'] if label['name'].lower() == ready]
     if len(ids) != 1 or not isinstance(ids[0], str) or not ids[0]:
         raise Diagnostic('unknown current ready label')
-    if not verified_history(github, repo, issue['number'], ids[0], trusted):
+    if not verified_history(github, repo, issue['number'], ids[0], trusted, own_ref):
         return False
     blockers = pages(github, path + '/dependencies/blocked_by?per_page=100')
     summary = issue['issue_dependencies_summary']

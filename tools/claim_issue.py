@@ -72,7 +72,7 @@ def select_for_claim(name, profile, github):
     return select([name], {name: profile}, github, read_comments=remember, on_change=changed)
 
 
-def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, owner, state):
+def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, owner, state, execute=None, authenticate=None):
     phase = 'verification' if resume else 'prewrite'
     try:
         if (profile['repo'] != approved_repo or type(owner) is not int or owner <= 0
@@ -102,9 +102,12 @@ def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, o
                     return selected
                 number = selected['number']
 
+            task = ''
             def issue_read(**kwargs):
+                nonlocal task
                 get_issue = ['--method', 'GET', f'repos/{approved_repo}/issues/{number}']
                 issue = github(get_issue)
+                task = (issue.get('title') or '') + '\n' + (issue.get('body') or '')
                 if type(issue['number']) is not int or issue['number'] != number:
                     raise Diagnostic('issue identity changed')
                 def stable_comments(adapter, path):
@@ -148,10 +151,23 @@ def run_profile(name, run_id, *, resume, profile, github, post, approved_repo, o
                     raise Diagnostic('invalid comment ID in POST response')
                 record.rename(record.with_name(f'{record.name}.{known_id}'))
                 os.fsync(directory)
-            comment_id = verify(issue_read, body, owner, known_id)
+            identity = dict(repo=approved_repo, number=number, run_id=run_id, owner=owner, claim_id=known_id)
+            own_ref = execute.own_ref(identity) if known_id and hasattr(execute, 'own_ref') else None
+            comment_id = verify(lambda **kw: issue_read(own_ref=own_ref, **kw), body, owner, known_id)
             if known_id is None:
                 record.rename(record.with_name(f'{record.name}.{comment_id}'))
                 os.fsync(directory)
+            if execute is not None:
+                # A verification result returned outside this lock is not an execution grant.
+                phase = 'execution'
+                def recheck(own_ref=None):
+                    actor = authenticate() if authenticate else None
+                    if not isinstance(actor, dict) or actor.get('type') != 'User' or type(actor.get('id')) is not int or actor['id'] != owner:
+                        raise Diagnostic('execution identity not confirmed')
+                    verify(lambda **kw: issue_read(own_ref=own_ref, **kw), body, owner, comment_id)
+                recheck(own_ref)
+                return execute(dict(repo=approved_repo, number=number, run_id=run_id,
+                                    owner=owner, claim_id=comment_id), task[:8192], recheck)
         return dict(status='verified_only' if resume else 'claimed', repo=approved_repo, number=number,
                     run_id=run_id, owner=owner)
     except Diagnostic as error:
@@ -165,9 +181,11 @@ def command(argv):
     try:
         if (sys.platform != 'linux' or len(argv) not in (2, 3)
                 or not re.fullmatch('[a-zA-Z0-9_-]+', argv[0])
-                or not re.fullmatch('[a-f0-9]{32}', argv[1]) or argv[2:] not in ([], ['--resume'])):
+                or not re.fullmatch('[a-f0-9]{32}', argv[1]) or argv[2:] not in ([], ['--resume'], ['--draft'])):
             raise Diagnostic('expected PROFILE RUN_ID [--resume] on Linux')
         name, run = argv[:2]
+        if argv[2:] == ['--draft']:
+            return dict(status='not_run', reason='no approved isolated subscription transport', run_id=run)
         root = Path('/etc/setupAIv2')
         grants = json.loads((root / 'claim-profiles.json').read_text(), object_pairs_hook=unique_object)
         grant = grants[name]
@@ -211,4 +229,4 @@ def command(argv):
 if __name__ == '__main__':
     result = command(sys.argv[1:])
     print(json.dumps(result))
-    sys.exit(2 if result['status'] == 'diagnostic' else 0)
+    sys.exit(2 if result['status'] == 'diagnostic' or (sys.argv[-1] == '--draft' and result['status'] != 'draft') else 0)

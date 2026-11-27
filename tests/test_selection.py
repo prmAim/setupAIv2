@@ -58,12 +58,14 @@ class Selection(unittest.TestCase):
                     'content': base64.b64encode(json.dumps(self.profile).encode()).decode()}
         calls = []
         def transport(argv, **kwargs):
+            self.assertEqual(kwargs['env']['GH_CONFIG_DIR'], '/trusted/reader')
+            self.assertNotIn('TokenGitHub', kwargs['env'])
             calls.append(argv)
             response = contents if len(calls) == 1 else [[]]
             return subprocess.CompletedProcess(argv, 0, json.dumps(response).encode())
         from pathlib import Path
         import os
-        with patch.object(Path, 'read_text', autospec=True, return_value=json.dumps(index)) as read, patch('subprocess.run', transport):
+        with patch.dict(os.environ, dict(GH_CONFIG_DIR='/trusted/reader', TokenGitHub='marker')), patch.object(Path, 'read_text', autospec=True, return_value=json.dumps(index)) as read, patch('subprocess.run', transport):
             self.assertEqual(self.run_cli('example'), (0, {'status': 'no_work'}))
         root = Path('C:/Program Files/setupAIv2' if os.name == 'nt' else '/etc/setupAIv2')
         read.assert_called_once_with(root / 'selection-profiles.json', encoding='utf-8')
