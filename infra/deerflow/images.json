@@ -1,0 +1,7 @@
+{
+  "version": "v2.2.0",
+  "commit": "58fc5bd5b8e6ea46538e9481ba06ca2a46e14e2a",
+  "backend": "ghcr.io/bytedance/deer-flow-backend@sha256:0eff3cb395700c5bfee09a6bc57f878dcdc6232591f2210896e5fe5fdf9c145b",
+  "frontend": "ghcr.io/bytedance/deer-flow-frontend@sha256:b4eded4d89b3dab09e9edf615185079059def29bbacc83b5475ea94e3442369c",
+  "nginx": "nginx@sha256:54f2a904c251d5a34adf545a72d32515a15e08418dae0266e23be2e18c66fefa"
+}

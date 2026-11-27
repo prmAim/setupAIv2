@@ -57,3 +57,24 @@ docker compose --env-file infra/langfuse/.env -f infra/langfuse/compose.yaml sto
 - [S3 / Blob Storage](https://langfuse.com/self-hosting/deployment/infrastructure/blobstorage)
 - [Headless initialization](https://langfuse.com/self-hosting/administration/headless-initialization)
 - [SeaweedFS mini](https://github.com/seaweedfs/seaweedfs/wiki/Quick-Start-with-weed-mini)
+
+## Отдельные проекты Fortune и Orbita
+
+После штатного запуска базового стека:
+
+```powershell
+cd C:\Git\setupAIv2
+uv run --offline --no-sync python tools/provision_langfuse_projects.py
+```
+
+Скрипт использует headless initialization, создаёт отсутствующие проекты
+`fortune` и `orbita` с существующими ключами из `.env` этих репозиториев.
+Он проверяет область доступа ключей и возвращает web к базовой конфигурации.
+Данные не удаляет, ключи OpenAI не меняет; несколько раз перезапускает web,
+поэтому выполнять вне активных задач. Не нужен при обычном запуске ПК.
+Если существующий проект имеет другие ключи, проверка завершается ошибкой;
+скрипт не сбрасывает ключи и не обходит проверку.
+
+26.11.2026 выполнена согласованная переинициализация: прежние трассы удалены,
+созданы три проекта и подтверждено сохранение новых трасс DeerFlow для обоих
+агентов. Отчёт: `.scratch/deerflow/langfuse-acceptance.json`.

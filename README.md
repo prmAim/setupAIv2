@@ -1,5 +1,10 @@
 # setupAIv2
 
+Исследование интеграции: [готовые пути Codex + DeerFlow и предложение упрощения](docs/validation/codex-deerflow-integration-research-20261127.md)
+— сравнение на 27.11.2026, офлайн-доказательства и границы будущей живой проверки.
+
+Подготовленная интеграция: [CodexChatModel, refresh и отмена — офлайн-проверки](docs/validation/deerflow-codex-integration-20261127.md).
+
 Python-окружение для LangGraph, LangChain, Pydantic и локального Langfuse.
 Модель для первых проверок — OpenAI `gpt-6-luna` через Responses API.
 Приложение: `aim_setupaiv2`, окружение: `development`.
@@ -113,6 +118,7 @@ uv add langgraph langchain langchain-openai pydantic pydantic-settings langfuse
 
 ## Документация
 
+- [DeerFlow v2.2.0: Fortune и Orbita — вход, запуск, остановка и ограничения](infra/deerflow/README.md)
 - [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview)
 - [LangChain](https://docs.langchain.com/oss/python/langchain/install)
 - [Pydantic](https://docs.pydantic.dev/latest/)

@@ -1,0 +1,40 @@
+name: DeerFlow Codex offline
+
+on:
+  pull_request:
+    paths:
+      - 'infra/deerflow/**'
+      - 'tests/deerflow/**'
+      - 'tools/build_deerflow_codex.py'
+      - 'tools/deerflow_platform.py'
+      - 'tests/test_deerflow_platform.py'
+      - 'tests/test_build_deerflow_codex.py'
+      - '.github/workflows/deerflow-codex.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  codex-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Fetch pinned public build inputs
+        run: |
+          BASE=$(python3 -c 'import json; print(json.load(open("infra/deerflow/images.json"))["backend"])')
+          docker pull "$BASE"
+          curl --fail --location --proto '=https' --tlsv1.2 --output /tmp/codex.tar.gz https://github.com/openai/codex/releases/download/rust-v0.172.0/codex-x86_64-unknown-linux-musl.tar.gz
+      - name: Build with verified checksums and network disabled
+        run: python3 tools/build_deerflow_codex.py --codex-archive /tmp/codex.tar.gz
+      - name: Test without external network or credentials
+        run: |
+          IMAGE=$(python3 -c 'import json; print(json.load(open(".scratch/deerflow-codex/image.json"))["image"])')
+          docker run --rm --pull never --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 128 --memory 1g \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --mount "type=bind,source=$PWD/tests/deerflow,target=/tests,readonly" \
+            --entrypoint /app/backend/.venv/bin/python "$IMAGE" \
+            -B -m pytest /tests -q -p no:cacheprovider
